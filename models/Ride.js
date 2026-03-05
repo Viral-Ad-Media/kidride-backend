@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 
 const rideSchema = mongoose.Schema({
   parent: { type: mongoose.Schema.Types.ObjectId, required: true, ref: 'User' },
-  child: { type: mongoose.Schema.Types.ObjectId, required: true }, // ID from User.children
+  child: { type: String, required: true }, // User.children subdoc id or frontend child id
   driver: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   
   pickupLocation: { type: String, required: true },
@@ -11,7 +11,15 @@ const rideSchema = mongoose.Schema({
   
   status: { 
     type: String, 
-    enum: ['requested', 'searching_driver', 'driver_assigned', 'driver_arrived', 'in_progress', 'completed', 'cancelled'],
+    enum: [
+      'requested',
+      'searching_driver',
+      'driver_assigned',
+      'driver_arrived_at_pickup',
+      'child_picked_up',
+      'completed',
+      'cancelled'
+    ],
     default: 'requested'
   },
   

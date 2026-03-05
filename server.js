@@ -11,20 +11,36 @@ connectDB();
 
 const app = express();
 const server = http.createServer(app);
+const allowedOrigins = (process.env.FRONTEND_URLS || 'http://localhost:3000,http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true
+};
 
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Routes
 app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/api/users', require('./routes/userRoutes'));
 app.use('/api/rides', require('./routes/rideRoutes'));
 
 // Socket.io Setup
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000", // Your Frontend URL
-    methods: ["GET", "POST"]
+    origin: allowedOrigins,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+    credentials: true
   }
 });
 
