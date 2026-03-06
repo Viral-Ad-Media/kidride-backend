@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const Ride = require('../models/Ride');
 const { protect } = require('../middleware/authMiddleware');
+const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
 const OPEN_REQUEST_STATUSES = ['requested', 'searching_driver'];
@@ -19,6 +20,15 @@ const DRIVER_STATUS_TRANSITIONS = {
 const SAFE_WORDS = ['Lions', 'Falcon', 'Comet', 'Maple', 'Echo', 'Atlas'];
 const VALID_RIDE_STATUSES = Ride.schema.path('status').enumValues;
 const VALID_SERVICE_TYPES = Ride.schema.path('serviceType').enumValues;
+const rideRequestRateLimitWindowMs = parsePositiveInt(process.env.RIDE_REQUEST_RATE_LIMIT_WINDOW_MS, 60 * 1000);
+const rideRequestRateLimitMaxRequests = parsePositiveInt(process.env.RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS, 10);
+const rideRequestLimiter = createRateLimiter({
+  windowMs: rideRequestRateLimitWindowMs,
+  max: rideRequestRateLimitMaxRequests,
+  message: 'Too many ride requests. Please wait and try again.',
+  keyPrefix: 'ride-request',
+  keyGenerator: (req) => (req.user && req.user._id ? `user:${req.user._id.toString()}` : null)
+});
 
 const populateRideQuery = (query) => query
   .populate('driver', 'name vehicle photoUrl isVerifiedDriver')
@@ -72,7 +82,7 @@ const canAccessRide = (user, ride) => {
 };
 
 // @route   POST /api/rides/request
-router.post('/request', protect, async (req, res) => {
+router.post('/request', protect, rideRequestLimiter, async (req, res) => {
   try {
     const normalized = normalizeRideRequestPayload(req.body);
     if (normalized.error) {

@@ -46,6 +46,12 @@ kidride-backend/
    JWT_SECRET=replace_with_long_random_secret
    PORT=5000
    FRONTEND_URLS=http://localhost:3000,http://localhost:5173,https://kid-ride.vercel.app
+   RATE_LIMIT_WINDOW_MS=900000
+   RATE_LIMIT_MAX_REQUESTS=300
+   AUTH_RATE_LIMIT_WINDOW_MS=900000
+   AUTH_RATE_LIMIT_MAX_ATTEMPTS=20
+   RIDE_REQUEST_RATE_LIMIT_WINDOW_MS=60000
+   RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS=10
    ```
 3. Start the server:
    ```bash
@@ -57,6 +63,12 @@ kidride-backend/
 - `JWT_SECRET` required, signing key for JWT access tokens.
 - `PORT` optional, defaults to `5000`.
 - `FRONTEND_URLS` optional, comma-separated CORS allowlist for HTTP + Socket.IO.
+- `RATE_LIMIT_WINDOW_MS` optional, global limit window in ms (default `900000`).
+- `RATE_LIMIT_MAX_REQUESTS` optional, global max requests per window (default `300`).
+- `AUTH_RATE_LIMIT_WINDOW_MS` optional, auth routes window in ms (default `900000`).
+- `AUTH_RATE_LIMIT_MAX_ATTEMPTS` optional, max auth attempts per window (default `20`).
+- `RIDE_REQUEST_RATE_LIMIT_WINDOW_MS` optional, ride request window in ms (default `60000`).
+- `RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS` optional, max ride requests per window (default `10`).
 
 ## Authentication
 - Protected routes require:
@@ -149,6 +161,19 @@ Server events configured in `server.js`.
 - Default allowlist if env is missing:
   - `http://localhost:3000`
   - `http://localhost:5173`
+
+## Rate Limiting
+- Global limiter is applied to all API routes.
+- Stricter limiter is applied to:
+  - `POST /api/auth/register`
+  - `POST /api/auth/login`
+- Per-user limiter is applied to:
+  - `POST /api/rides/request`
+
+When exceeded, API returns:
+- `429 Too Many Requests`
+- `Retry-After` header
+- JSON body with `message` and `retryAfterSeconds`
 
 ## Notes for Frontend Integration
 - Frontend expects user payload shape with:
