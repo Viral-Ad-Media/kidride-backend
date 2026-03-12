@@ -15,6 +15,8 @@ const authLimiter = createRateLimiter({
   keyPrefix: 'auth'
 });
 
+const normalizeEmail = (value = '') => value.trim().toLowerCase();
+
 // Generate JWT
 const generateToken = (id) => {
   return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
@@ -45,16 +47,19 @@ const formatAuthUser = (user, token) => {
 // @route   POST /api/auth/register
 router.post('/register', authLimiter, async (req, res) => {
   const { name, email, password, role } = req.body;
+  const normalizedName = typeof name === 'string' ? name.trim() : '';
+  const normalizedEmail = typeof email === 'string' ? normalizeEmail(email) : '';
+  const normalizedRole = typeof role === 'string' ? role.trim().toLowerCase() : role;
 
   try {
-    if (!name || !email || !password) {
+    if (!normalizedName || !normalizedEmail || !password) {
       return res.status(400).json({ message: 'name, email, and password are required' });
     }
-    if (role && !['parent', 'driver', 'admin'].includes(role)) {
+    if (normalizedRole && !['parent', 'driver', 'admin'].includes(normalizedRole)) {
       return res.status(400).json({ message: 'role must be parent, driver, or admin' });
     }
 
-    const userExists = await User.findOne({ email });
+    const userExists = await User.findOne({ email: normalizedEmail });
     if (userExists) {
       return res.status(400).json({ message: 'User already exists' });
     }
@@ -63,10 +68,10 @@ router.post('/register', authLimiter, async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const user = await User.create({
-      name,
-      email,
+      name: normalizedName,
+      email: normalizedEmail,
       password: hashedPassword,
-      role: role || 'parent'
+      role: normalizedRole || 'parent'
     });
 
     if (user) {
@@ -82,13 +87,14 @@ router.post('/register', authLimiter, async (req, res) => {
 // @route   POST /api/auth/login
 router.post('/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
+  const normalizedEmail = typeof email === 'string' ? normalizeEmail(email) : '';
 
   try {
-    if (!email || !password) {
+    if (!normalizedEmail || !password) {
       return res.status(400).json({ message: 'email and password are required' });
     }
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: normalizedEmail });
     if (user && (await bcrypt.compare(password, user.password))) {
       return res.json(formatAuthUser(user, generateToken(user.id)));
     } else {

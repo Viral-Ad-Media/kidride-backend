@@ -9,7 +9,7 @@ const childSchema = mongoose.Schema({
 
 const userSchema = mongoose.Schema({
   name: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true, trim: true, lowercase: true },
   password: { type: String, required: true },
   role: { type: String, enum: ['parent', 'driver', 'admin'], default: 'parent' },
   phone: { type: String },
