@@ -66,6 +66,17 @@ create index if not exists rides_parent_id_idx on public.rides (parent_id, creat
 create index if not exists rides_driver_id_idx on public.rides (driver_id, created_at desc);
 create index if not exists rides_status_idx on public.rides (status, created_at desc);
 
+create table if not exists public.ride_declines (
+  id uuid primary key default gen_random_uuid(),
+  ride_id uuid not null references public.rides (id) on delete cascade,
+  driver_id uuid not null references public.profiles (id) on delete cascade,
+  created_at timestamptz not null default timezone('utc', now()),
+  unique (ride_id, driver_id)
+);
+
+create index if not exists ride_declines_driver_id_idx on public.ride_declines (driver_id, created_at desc);
+create index if not exists ride_declines_ride_id_idx on public.ride_declines (ride_id, created_at desc);
+
 create or replace function public.set_updated_at()
 returns trigger
 language plpgsql
@@ -97,6 +108,7 @@ execute function public.set_updated_at();
 alter table public.profiles enable row level security;
 alter table public.children enable row level security;
 alter table public.rides enable row level security;
+alter table public.ride_declines enable row level security;
 
 drop policy if exists "Users can read their own profile" on public.profiles;
 create policy "Users can read their own profile"
@@ -156,3 +168,17 @@ for update
 to authenticated
 using (auth.uid() = parent_id or auth.uid() = driver_id)
 with check (auth.uid() = parent_id or auth.uid() = driver_id);
+
+drop policy if exists "Drivers can read their declines" on public.ride_declines;
+create policy "Drivers can read their declines"
+on public.ride_declines
+for select
+to authenticated
+using (auth.uid() = driver_id);
+
+drop policy if exists "Drivers can create their declines" on public.ride_declines;
+create policy "Drivers can create their declines"
+on public.ride_declines
+for insert
+to authenticated
+with check (auth.uid() = driver_id);

@@ -53,6 +53,7 @@ const rideRequestLimiter = createRateLimiter({
 
 const generateTripCode = () => Math.floor(1000 + Math.random() * 9000).toString();
 const generateSafeWord = () => SAFE_WORDS[Math.floor(Math.random() * SAFE_WORDS.length)];
+const MAX_OPEN_RIDE_FETCH = 100;
 
 const normalizeRideRequestPayload = (body) => {
   const child = body.childId || body.child;
@@ -93,6 +94,19 @@ const canAccessRide = (user, ride) => {
 };
 
 const orFilterForUser = (userId) => `parent_id.eq.${userId},driver_id.eq.${userId}`;
+
+const fetchDeclinedRideIdsByDriver = async (driverId) => {
+  const { data, error } = await supabaseAdmin
+    .from('ride_declines')
+    .select('ride_id')
+    .eq('driver_id', driverId);
+
+  if (error) {
+    throw error;
+  }
+
+  return new Set((data || []).map((row) => row.ride_id));
+};
 
 router.post('/request', protect, rideRequestLimiter, async (req, res) => {
   try {
@@ -144,7 +158,6 @@ router.get('/open', protect, async (req, res) => {
 
     const requestedLimit = Number(req.query.limit) || 20;
     const limit = Math.max(1, Math.min(requestedLimit, 100));
-
     const rides = await fetchRideRows(
       supabaseAdmin
         .from('rides')
@@ -152,10 +165,20 @@ router.get('/open', protect, async (req, res) => {
         .in('status', OPEN_REQUEST_STATUSES)
         .is('driver_id', null)
         .order('created_at', { ascending: false })
-        .limit(limit)
+        .limit(MAX_OPEN_RIDE_FETCH)
     );
 
-    return res.json(rides.map(formatRide));
+    if (req.user.role === 'admin') {
+      return res.json(rides.slice(0, limit).map(formatRide));
+    }
+
+    const declinedRideIds = await fetchDeclinedRideIdsByDriver(req.user.id);
+    const visibleRides = rides
+      .filter((ride) => !declinedRideIds.has(ride.id))
+      .slice(0, limit)
+      .map(formatRide);
+
+    return res.json(visibleRides);
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -289,6 +312,46 @@ router.put('/:id/accept', protect, async (req, res) => {
     }
 
     return res.json(payload);
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+router.put('/:id/decline', protect, async (req, res) => {
+  try {
+    if (req.user.role !== 'driver') {
+      return res.status(403).json({ message: 'Only drivers can decline rides' });
+    }
+
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride) {
+      return res.status(404).json({ message: 'Ride not found' });
+    }
+    if (TERMINAL_STATUSES.has(ride.status)) {
+      return res.status(409).json({ message: 'This ride is no longer available' });
+    }
+    if (!OPEN_REQUEST_STATUSES.includes(ride.status)) {
+      return res.status(409).json({ message: `Ride cannot be declined from status ${ride.status}` });
+    }
+    if (ride.driver_id) {
+      return res.status(409).json({ message: 'Ride has already been assigned' });
+    }
+
+    const { error } = await supabaseAdmin
+      .from('ride_declines')
+      .upsert({
+        ride_id: req.params.id,
+        driver_id: req.user.id
+      }, {
+        onConflict: 'ride_id,driver_id',
+        ignoreDuplicates: true
+      });
+
+    if (error) {
+      throw error;
+    }
+
+    return res.json({ message: 'Ride declined' });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }

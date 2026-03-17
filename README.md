@@ -91,6 +91,8 @@ kidride-backend/
   - Child profiles owned by a parent profile
 - `rides`
   - Ride requests, assignments, and trip lifecycle data
+- `ride_declines`
+  - Per-driver dismiss records so declined open requests do not immediately reappear
 
 ## API Endpoints
 
@@ -137,6 +139,9 @@ kidride-backend/
 - `PUT /:id/accept`
   - Driver/Admin only
   - Assigns current driver and sets status to `driver_assigned`
+- `PUT /:id/decline`
+  - Driver only
+  - Persists a dismiss action for that driver on an open request
 - `PUT /:id/status`
   - Driver/Admin only
   - Body: `status`
