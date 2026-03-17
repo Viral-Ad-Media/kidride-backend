@@ -1,6 +1,14 @@
 const express = require('express');
-const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
+const {
+  fetchChildrenRowsByParentId,
+  fetchUserById,
+  formatChild,
+  insertChildRow,
+  updateProfileRowById
+} = require('../lib/repository');
+
+const router = express.Router();
 
 const formatUser = (user) => ({
   id: user.id,
@@ -16,47 +24,46 @@ const formatUser = (user) => ({
   vehicle: user.vehicle || {}
 });
 
-// @route   GET /api/users/profile
 router.get('/profile', protect, async (req, res) => {
   try {
-    res.json(formatUser(req.user));
+    return res.json(formatUser(req.user));
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   PUT /api/users/profile
 router.put('/profile', protect, async (req, res) => {
   try {
+    const updates = {};
     const { name, phone, photoUrl } = req.body;
 
     if (typeof name === 'string') {
-      req.user.name = name.trim();
+      updates.name = name.trim();
     }
     if (typeof phone === 'string') {
-      req.user.phone = phone.trim();
+      updates.phone = phone.trim();
     }
     if (typeof photoUrl === 'string') {
-      req.user.photoUrl = photoUrl.trim();
+      updates.photo_url = photoUrl.trim();
     }
 
-    await req.user.save();
-    res.json(formatUser(req.user));
+    await updateProfileRowById(req.user.id, updates);
+    const updatedUser = await fetchUserById(req.user.id);
+    return res.json(formatUser(updatedUser));
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   GET /api/users/children
 router.get('/children', protect, async (req, res) => {
   try {
-    res.json(req.user.children || []);
+    const children = await fetchChildrenRowsByParentId(req.user.id);
+    return res.json(children.map(formatChild));
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   POST /api/users/children
 router.post('/children', protect, async (req, res) => {
   try {
     const { name, age, notes, photoUrl } = req.body;
@@ -66,53 +73,50 @@ router.post('/children', protect, async (req, res) => {
       return res.status(400).json({ message: 'Valid child name and age are required' });
     }
 
-    req.user.children.push({
-      name: name.trim(),
+    const createdChild = await insertChildRow({
+      parent_id: req.user.id,
+      name: String(name).trim(),
       age: normalizedAge,
-      notes: typeof notes === 'string' ? notes.trim() : undefined,
-      photoUrl: typeof photoUrl === 'string' ? photoUrl.trim() : undefined
+      notes: typeof notes === 'string' ? notes.trim() : null,
+      photo_url: typeof photoUrl === 'string' ? photoUrl.trim() : null
     });
 
-    await req.user.save();
-    const createdChild = req.user.children[req.user.children.length - 1];
+    const children = await fetchChildrenRowsByParentId(req.user.id);
 
     return res.status(201).json({
-      child: createdChild,
-      children: req.user.children
+      child: formatChild(createdChild),
+      children: children.map(formatChild)
     });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   POST /api/users/driver-application
 router.post('/driver-application', protect, async (req, res) => {
   try {
     const { phone, vehicle, make, model, year, color, plate } = req.body;
-
-    if (typeof phone === 'string') {
-      req.user.phone = phone.trim();
-    }
 
     const incomingVehicle = vehicle && typeof vehicle === 'object'
       ? vehicle
       : { make, model, year, color, plate };
 
-    req.user.vehicle = {
-      make: incomingVehicle.make || req.user.vehicle?.make || '',
-      model: incomingVehicle.model || req.user.vehicle?.model || '',
-      year: incomingVehicle.year || req.user.vehicle?.year || '',
-      color: incomingVehicle.color || req.user.vehicle?.color || '',
-      plate: incomingVehicle.plate || req.user.vehicle?.plate || ''
-    };
+    await updateProfileRowById(req.user.id, {
+      phone: typeof phone === 'string' ? phone.trim() : req.user.phone,
+      vehicle: {
+        make: incomingVehicle.make || req.user.vehicle?.make || '',
+        model: incomingVehicle.model || req.user.vehicle?.model || '',
+        year: incomingVehicle.year || req.user.vehicle?.year || '',
+        color: incomingVehicle.color || req.user.vehicle?.color || '',
+        plate: incomingVehicle.plate || req.user.vehicle?.plate || ''
+      },
+      driver_application_status: 'pending'
+    });
 
-    req.user.driverApplicationStatus = 'pending';
-
-    await req.user.save();
+    const updatedUser = await fetchUserById(req.user.id);
 
     return res.json({
       message: 'Driver application submitted successfully',
-      user: formatUser(req.user)
+      user: formatUser(updatedUser)
     });
   } catch (error) {
     return res.status(500).json({ message: error.message });

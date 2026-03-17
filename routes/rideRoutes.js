@@ -1,8 +1,16 @@
 const express = require('express');
-const router = express.Router();
-const Ride = require('../models/Ride');
 const { protect } = require('../middleware/authMiddleware');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
+const { supabaseAdmin } = require('../config/supabase');
+const {
+  RIDE_SELECT,
+  fetchRideRowById,
+  fetchRideRows,
+  formatRide,
+  updateRideRow
+} = require('../lib/repository');
+
+const router = express.Router();
 
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
 const OPEN_REQUEST_STATUSES = ['requested', 'searching_driver'];
@@ -18,8 +26,21 @@ const DRIVER_STATUS_TRANSITIONS = {
   child_picked_up: ['completed']
 };
 const SAFE_WORDS = ['Lions', 'Falcon', 'Comet', 'Maple', 'Echo', 'Atlas'];
-const VALID_RIDE_STATUSES = Ride.schema.path('status').enumValues;
-const VALID_SERVICE_TYPES = Ride.schema.path('serviceType').enumValues;
+const VALID_RIDE_STATUSES = [
+  'requested',
+  'searching_driver',
+  'driver_assigned',
+  'driver_arrived_at_pickup',
+  'child_picked_up',
+  'completed',
+  'cancelled'
+];
+const VALID_SERVICE_TYPES = [
+  'pickup_only',
+  'dropoff_only',
+  'pickup_and_dropoff',
+  'stay_with_child_and_dropoff'
+];
 const rideRequestRateLimitWindowMs = parsePositiveInt(process.env.RIDE_REQUEST_RATE_LIMIT_WINDOW_MS, 60 * 1000);
 const rideRequestRateLimitMaxRequests = parsePositiveInt(process.env.RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS, 10);
 const rideRequestLimiter = createRateLimiter({
@@ -27,12 +48,8 @@ const rideRequestLimiter = createRateLimiter({
   max: rideRequestRateLimitMaxRequests,
   message: 'Too many ride requests. Please wait and try again.',
   keyPrefix: 'ride-request',
-  keyGenerator: (req) => (req.user && req.user._id ? `user:${req.user._id.toString()}` : null)
+  keyGenerator: (req) => (req.user && req.user._id ? `user:${req.user._id}` : null)
 });
-
-const populateRideQuery = (query) => query
-  .populate('driver', 'name vehicle photoUrl isVerifiedDriver')
-  .populate('parent', 'name photoUrl');
 
 const generateTripCode = () => Math.floor(1000 + Math.random() * 9000).toString();
 const generateSafeWord = () => SAFE_WORDS[Math.floor(Math.random() * SAFE_WORDS.length)];
@@ -71,17 +88,12 @@ const canAccessRide = (user, ride) => {
   if (user.role === 'admin') {
     return true;
   }
-  const userId = user._id.toString();
-  const parentId = ride.parent?._id ? ride.parent._id.toString() : ride.parent?.toString();
-  const driverId = ride.driver?._id ? ride.driver._id.toString() : ride.driver?.toString();
 
-  return (
-    parentId === userId ||
-    driverId === userId
-  );
+  return ride.parent_id === user.id || ride.driver_id === user.id;
 };
 
-// @route   POST /api/rides/request
+const orFilterForUser = (userId) => `parent_id.eq.${userId},driver_id.eq.${userId}`;
+
 router.post('/request', protect, rideRequestLimiter, async (req, res) => {
   try {
     const normalized = normalizeRideRequestPayload(req.body);
@@ -89,33 +101,41 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       return res.status(400).json({ message: normalized.error });
     }
 
-    const ride = await Ride.create({
-      parent: req.user._id,
-      child: normalized.child,
-      pickupLocation: normalized.pickupLocation,
-      dropoffLocation: normalized.dropoffLocation,
-      pickupTime: normalized.pickupTime,
-      status: 'searching_driver',
-      price: normalized.price,
-      tripCode: generateTripCode(),
-      safeWord: generateSafeWord(),
-      serviceType: normalized.serviceType
-    });
+    const { data, error } = await supabaseAdmin
+      .from('rides')
+      .insert({
+        parent_id: req.user.id,
+        child_id: normalized.child,
+        pickup_location: normalized.pickupLocation,
+        dropoff_location: normalized.dropoffLocation,
+        pickup_time: normalized.pickupTime ? normalized.pickupTime.toISOString() : null,
+        status: 'searching_driver',
+        price: normalized.price,
+        trip_code: generateTripCode(),
+        safe_word: generateSafeWord(),
+        service_type: normalized.serviceType
+      })
+      .select('id')
+      .single();
 
-    const populatedRide = await populateRideQuery(Ride.findById(ride._id));
-
-    const io = req.app.get('io');
-    if (io) {
-      io.to('drivers').emit('ride_available', populatedRide);
+    if (error) {
+      throw error;
     }
 
-    res.status(201).json(populatedRide);
+    const createdRide = await fetchRideRowById(data.id);
+    const payload = formatRide(createdRide);
+    const io = req.app.get('io');
+
+    if (io) {
+      io.to('drivers').emit('ride_available', payload);
+    }
+
+    return res.status(201).json(payload);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   GET /api/rides/open
 router.get('/open', protect, async (req, res) => {
   try {
     if (!['driver', 'admin'].includes(req.user.role)) {
@@ -125,120 +145,155 @@ router.get('/open', protect, async (req, res) => {
     const requestedLimit = Number(req.query.limit) || 20;
     const limit = Math.max(1, Math.min(requestedLimit, 100));
 
-    const rides = await populateRideQuery(
-      Ride.find({
-        status: { $in: OPEN_REQUEST_STATUSES },
-        $or: [{ driver: { $exists: false } }, { driver: null }]
-      })
-        .sort({ createdAt: -1 })
+    const rides = await fetchRideRows(
+      supabaseAdmin
+        .from('rides')
+        .select(RIDE_SELECT)
+        .in('status', OPEN_REQUEST_STATUSES)
+        .is('driver_id', null)
+        .order('created_at', { ascending: false })
         .limit(limit)
     );
 
-    return res.json(rides);
+    return res.json(rides.map(formatRide));
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   GET /api/rides/active
 router.get('/active', protect, async (req, res) => {
   try {
-    const ride = await populateRideQuery(Ride.findOne({
-      $or: [{ parent: req.user._id }, { driver: req.user._id }],
-      status: { $nin: ['completed', 'cancelled'] }
-    }).sort({ updatedAt: -1 }));
-    
-    res.json(ride);
+    const rides = await fetchRideRows(
+      supabaseAdmin
+        .from('rides')
+        .select(RIDE_SELECT)
+        .or(orFilterForUser(req.user.id))
+        .neq('status', 'completed')
+        .neq('status', 'cancelled')
+        .order('updated_at', { ascending: false })
+        .limit(1)
+    );
+
+    return res.json(rides[0] ? formatRide(rides[0]) : null);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   GET /api/rides
 router.get('/', protect, async (req, res) => {
   try {
     const { scope = 'all' } = req.query;
     const requestedLimit = Number(req.query.limit) || 50;
     const limit = Math.max(1, Math.min(requestedLimit, 100));
 
-    const filter = req.user.role === 'admin'
-      ? {}
-      : { $or: [{ parent: req.user._id }, { driver: req.user._id }] };
+    let query = supabaseAdmin
+      .from('rides')
+      .select(RIDE_SELECT)
+      .order('created_at', { ascending: false })
+      .limit(limit);
 
-    if (scope === 'active') {
-      filter.status = { $nin: Array.from(TERMINAL_STATUSES) };
-    } else if (scope === 'past') {
-      filter.status = { $in: Array.from(TERMINAL_STATUSES) };
-    } else if (scope === 'upcoming') {
-      filter.status = { $in: UPCOMING_STATUSES };
+    if (req.user.role !== 'admin') {
+      query = query.or(orFilterForUser(req.user.id));
     }
 
-    const rides = await populateRideQuery(
-      Ride.find(filter)
-        .sort({ createdAt: -1 })
-        .limit(limit)
-    );
+    if (scope === 'active') {
+      query = query.neq('status', 'completed').neq('status', 'cancelled');
+    } else if (scope === 'past') {
+      query = query.in('status', Array.from(TERMINAL_STATUSES));
+    } else if (scope === 'upcoming') {
+      query = query.in('status', UPCOMING_STATUSES);
+    }
 
-    return res.json(rides);
+    const rides = await fetchRideRows(query);
+    return res.json(rides.map(formatRide));
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   GET /api/rides/:id
 router.get('/:id', protect, async (req, res) => {
   try {
-    const ride = await populateRideQuery(Ride.findById(req.params.id));
+    const ride = await fetchRideRowById(req.params.id);
     if (!ride) {
       return res.status(404).json({ message: 'Ride not found' });
     }
     if (!canAccessRide(req.user, ride)) {
       return res.status(403).json({ message: 'Not authorized to access this ride' });
     }
-    return res.json(ride);
+    return res.json(formatRide(ride));
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   PUT /api/rides/:id/accept
 router.put('/:id/accept', protect, async (req, res) => {
   try {
     if (!['driver', 'admin'].includes(req.user.role)) {
       return res.status(403).json({ message: 'Only drivers can accept rides' });
     }
 
-    const ride = await Ride.findById(req.params.id);
-    if (!ride) {
+    const existingRide = await fetchRideRowById(req.params.id);
+    if (!existingRide) {
       return res.status(404).json({ message: 'Ride not found' });
     }
-    if (TERMINAL_STATUSES.has(ride.status)) {
+    if (TERMINAL_STATUSES.has(existingRide.status)) {
       return res.status(409).json({ message: 'This ride is no longer available' });
     }
-    if (!OPEN_REQUEST_STATUSES.includes(ride.status) && ride.status !== 'driver_assigned') {
-      return res.status(409).json({ message: `Ride cannot be accepted from status ${ride.status}` });
+
+    if (existingRide.status === 'driver_assigned' && existingRide.driver_id === req.user.id) {
+      return res.json(formatRide(existingRide));
     }
-    if (ride.driver && ride.driver.toString() !== req.user._id.toString()) {
+
+    if (!OPEN_REQUEST_STATUSES.includes(existingRide.status) && existingRide.status !== 'driver_assigned') {
+      return res.status(409).json({ message: `Ride cannot be accepted from status ${existingRide.status}` });
+    }
+    if (existingRide.driver_id && existingRide.driver_id !== req.user.id) {
       return res.status(409).json({ message: 'Ride already accepted by another driver' });
     }
 
-    ride.driver = req.user._id;
-    ride.status = 'driver_assigned';
-    await ride.save();
-    const populatedRide = await populateRideQuery(Ride.findById(ride._id));
+    const { data, error } = await supabaseAdmin
+      .from('rides')
+      .update({
+        driver_id: req.user.id,
+        status: 'driver_assigned',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', req.params.id)
+      .is('driver_id', null)
+      .in('status', OPEN_REQUEST_STATUSES)
+      .select(RIDE_SELECT)
+      .maybeSingle();
 
-    const io = req.app.get('io');
-    if (io) {
-      io.to(ride.parent.toString()).emit('ride_accepted', populatedRide);
+    if (error) {
+      throw error;
     }
 
-    return res.json(populatedRide);
+    if (!data) {
+      const latestRide = await fetchRideRowById(req.params.id);
+      if (!latestRide) {
+        return res.status(404).json({ message: 'Ride not found' });
+      }
+      if (latestRide.driver_id && latestRide.driver_id !== req.user.id) {
+        return res.status(409).json({ message: 'Ride already accepted by another driver' });
+      }
+      if (TERMINAL_STATUSES.has(latestRide.status)) {
+        return res.status(409).json({ message: 'This ride is no longer available' });
+      }
+      return res.status(409).json({ message: `Ride cannot be accepted from status ${latestRide.status}` });
+    }
+
+    const payload = formatRide(data);
+    const io = req.app.get('io');
+    if (io) {
+      io.to(data.parent_id).emit('ride_accepted', payload);
+    }
+
+    return res.json(payload);
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   PUT /api/rides/:id/status
 router.put('/:id/status', protect, async (req, res) => {
   try {
     const { status } = req.body;
@@ -251,7 +306,7 @@ router.put('/:id/status', protect, async (req, res) => {
       });
     }
 
-    const ride = await Ride.findById(req.params.id);
+    const ride = await fetchRideRowById(req.params.id);
     if (!ride) {
       return res.status(404).json({ message: 'Ride not found' });
     }
@@ -259,7 +314,7 @@ router.put('/:id/status', protect, async (req, res) => {
     if (req.user.role === 'admin') {
       ride.status = status;
     } else if (req.user.role === 'driver') {
-      if (!ride.driver || ride.driver.toString() !== req.user._id.toString()) {
+      if (!ride.driver_id || ride.driver_id !== req.user.id) {
         return res.status(403).json({ message: 'Only the assigned driver can update ride status' });
       }
       const allowedNextStatuses = DRIVER_STATUS_TRANSITIONS[ride.status] || [];
@@ -273,24 +328,23 @@ router.put('/:id/status', protect, async (req, res) => {
       return res.status(403).json({ message: 'Only drivers can update ride status' });
     }
 
-    await ride.save();
-    const populatedRide = await populateRideQuery(Ride.findById(ride._id));
-
+    const updatedRide = await updateRideRow(req.params.id, { status: ride.status });
+    const payload = formatRide(updatedRide);
     const io = req.app.get('io');
+
     if (io) {
-      io.to(ride.parent.toString()).emit('ride_status_updated', populatedRide);
+      io.to(updatedRide.parent_id).emit('ride_status_updated', payload);
     }
 
-    return res.json(populatedRide);
+    return res.json(payload);
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   PUT /api/rides/:id/cancel
 router.put('/:id/cancel', protect, async (req, res) => {
   try {
-    const ride = await Ride.findById(req.params.id);
+    const ride = await fetchRideRowById(req.params.id);
     if (!ride) {
       return res.status(404).json({ message: 'Ride not found' });
     }
@@ -298,24 +352,22 @@ router.put('/:id/cancel', protect, async (req, res) => {
       return res.status(409).json({ message: 'Ride is already completed or cancelled' });
     }
 
-    const userId = req.user._id.toString();
-    const isParent = ride.parent.toString() === userId;
-    const isAssignedDriver = ride.driver && ride.driver.toString() === userId;
+    const isParent = ride.parent_id === req.user.id;
+    const isAssignedDriver = ride.driver_id && ride.driver_id === req.user.id;
     const isAdmin = req.user.role === 'admin';
     if (!isParent && !isAssignedDriver && !isAdmin) {
       return res.status(403).json({ message: 'Not authorized to cancel this ride' });
     }
 
-    ride.status = 'cancelled';
-    await ride.save();
-    const populatedRide = await populateRideQuery(Ride.findById(ride._id));
-
+    const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled' });
+    const payload = formatRide(updatedRide);
     const io = req.app.get('io');
+
     if (io) {
-      io.to(ride.parent.toString()).emit('ride_status_updated', populatedRide);
+      io.to(updatedRide.parent_id).emit('ride_status_updated', payload);
     }
 
-    return res.json(populatedRide);
+    return res.json(payload);
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }

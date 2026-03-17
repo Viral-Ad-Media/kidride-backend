@@ -1,10 +1,11 @@
 const express = require('express');
-const router = express.Router();
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
 const { protect } = require('../middleware/authMiddleware');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
+const { supabaseAdmin, supabaseAuth } = require('../config/supabase');
+const { fetchUserById, upsertProfileRow } = require('../lib/repository');
+
+const router = express.Router();
 
 const authRateLimitWindowMs = parsePositiveInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000);
 const authRateLimitMaxAttempts = parsePositiveInt(process.env.AUTH_RATE_LIMIT_MAX_ATTEMPTS, 20);
@@ -15,12 +16,10 @@ const authLimiter = createRateLimiter({
   keyPrefix: 'auth'
 });
 
+const VALID_ROLES = new Set(['parent', 'driver', 'admin']);
 const normalizeEmail = (value = '') => value.trim().toLowerCase();
 
-// Generate JWT
-const generateToken = (id) => {
-  return jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
-};
+const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
 
 const formatAuthUser = (user, token) => {
   const payload = {
@@ -44,73 +43,124 @@ const formatAuthUser = (user, token) => {
   return payload;
 };
 
-// @route   POST /api/auth/register
+const createProfilePayload = ({ id, name, email, role }) => ({
+  id,
+  name,
+  email,
+  role,
+  phone: null,
+  photo_url: null,
+  is_verified_driver: false,
+  driver_application_status: 'none',
+  vehicle: {}
+});
+
+const resolveAuthenticatedUser = async (userId, includeToken = false) => {
+  const user = await fetchUserById(userId);
+  if (!user) {
+    throw new Error('Unable to load account profile');
+  }
+
+  return formatAuthUser(user, includeToken ? generateToken(user.id) : undefined);
+};
+
+const isExistingAccountError = (error) => {
+  if (!error) {
+    return false;
+  }
+
+  const message = String(error.message || '').toLowerCase();
+  return error.status === 422 || message.includes('already been registered');
+};
+
 router.post('/register', authLimiter, async (req, res) => {
   const { name, email, password, role } = req.body;
   const normalizedName = typeof name === 'string' ? name.trim() : '';
   const normalizedEmail = typeof email === 'string' ? normalizeEmail(email) : '';
-  const normalizedRole = typeof role === 'string' ? role.trim().toLowerCase() : role;
+  const normalizedRole = typeof role === 'string' ? role.trim().toLowerCase() : 'parent';
+
+  if (!normalizedName || !normalizedEmail || !password) {
+    return res.status(400).json({ message: 'name, email, and password are required' });
+  }
+
+  if (!VALID_ROLES.has(normalizedRole)) {
+    return res.status(400).json({ message: 'role must be parent, driver, or admin' });
+  }
+
+  let createdUserId = null;
 
   try {
-    if (!normalizedName || !normalizedEmail || !password) {
-      return res.status(400).json({ message: 'name, email, and password are required' });
-    }
-    if (normalizedRole && !['parent', 'driver', 'admin'].includes(normalizedRole)) {
-      return res.status(400).json({ message: 'role must be parent, driver, or admin' });
-    }
-
-    const userExists = await User.findOne({ email: normalizedEmail });
-    if (userExists) {
-      return res.status(400).json({ message: 'User already exists' });
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    const user = await User.create({
-      name: normalizedName,
+    const { data, error } = await supabaseAdmin.auth.admin.createUser({
       email: normalizedEmail,
-      password: hashedPassword,
-      role: normalizedRole || 'parent'
+      password,
+      email_confirm: true,
+      user_metadata: {
+        name: normalizedName,
+        role: normalizedRole
+      }
     });
 
-    if (user) {
-      return res.status(201).json(formatAuthUser(user, generateToken(user.id)));
+    if (error) {
+      if (isExistingAccountError(error)) {
+        return res.status(400).json({ message: 'User already exists' });
+      }
+
+      throw error;
     }
 
-    return res.status(400).json({ message: 'Invalid user data' });
+    if (!data.user) {
+      return res.status(400).json({ message: 'Invalid user data' });
+    }
+
+    createdUserId = data.user.id;
+
+    await upsertProfileRow(createProfilePayload({
+      id: data.user.id,
+      name: normalizedName,
+      email: normalizedEmail,
+      role: normalizedRole
+    }));
+
+    return res.status(201).json(await resolveAuthenticatedUser(data.user.id, true));
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    if (createdUserId) {
+      await supabaseAdmin.auth.admin.deleteUser(createdUserId);
+    }
+
+    return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   POST /api/auth/login
 router.post('/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   const normalizedEmail = typeof email === 'string' ? normalizeEmail(email) : '';
 
-  try {
-    if (!normalizedEmail || !password) {
-      return res.status(400).json({ message: 'email and password are required' });
-    }
+  if (!normalizedEmail || !password) {
+    return res.status(400).json({ message: 'email and password are required' });
+  }
 
-    const user = await User.findOne({ email: normalizedEmail });
-    if (user && (await bcrypt.compare(password, user.password))) {
-      return res.json(formatAuthUser(user, generateToken(user.id)));
-    } else {
+  try {
+    const { data, error } = await supabaseAuth.auth.signInWithPassword({
+      email: normalizedEmail,
+      password
+    });
+
+    if (error || !data.user) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
+
+    const userPayload = await resolveAuthenticatedUser(data.user.id, true);
+    return res.json(userPayload);
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 });
 
-// @route   GET /api/auth/me
 router.get('/me', protect, async (req, res) => {
   try {
-    res.json(formatAuthUser(req.user));
+    return res.json(formatAuthUser(req.user));
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ message: error.message });
   }
 });
 
