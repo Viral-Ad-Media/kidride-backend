@@ -1,188 +1,108 @@
-# KidRide Backend API
+# KidRide Backend
 
-Express + Supabase backend for KidRide authentication, profile management, child profiles, and ride lifecycle operations.
+Express 5 REST API for the KidRide web, Parent mobile, and Driver mobile clients. Supabase provides authentication, PostgreSQL data, and private document storage. Production API: `https://kidride-backend.vercel.app/api`.
 
-## Production
-- API base URL: `https://kidride-backend.vercel.app/api`
-- Primary frontend URL: `https://kid-ride.vercel.app/`
+## Development
 
-## Tech Stack
-- Node.js
-- Express 5
-- Supabase Auth
-- Supabase Postgres
-- JWT session tokens for the frontend
-- Socket.IO
+Use Node.js 22 or newer:
 
-## Project Structure
-```text
-kidride-backend/
-  config/
-    db.js                # Startup env validation
-    supabase.js          # Supabase clients
-  lib/
-    repository.js        # Shared profile/child/ride queries + formatters
-  middleware/
-    authMiddleware.js    # JWT guard backed by Supabase profiles
-  routes/
-    authRoutes.js        # /api/auth/*
-    userRoutes.js        # /api/users/*
-    rideRoutes.js        # /api/rides/*
-  supabase/
-    schema.sql           # Tables, triggers, and baseline RLS policies
-  server.js              # App bootstrap, CORS, Socket.IO
+```sh
+npm ci
+npm start
+npm test
 ```
 
-## Prerequisites
-- Node.js 18+ (Node.js 20+ recommended)
-- npm
-- A Supabase project
+The local server defaults to port 5000. Configure the environment before starting; Supabase credentials are required at import time.
 
-## Setup
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-2. In Supabase, run [`supabase/schema.sql`](./supabase/schema.sql) in the SQL editor.
-3. Create `.env` in `kidride-backend/`:
-   ```bash
-   SUPABASE_URL=https://your-project-ref.supabase.co
-   SUPABASE_ANON_KEY=your_supabase_anon_key
-   SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
-   JWT_SECRET=replace_with_long_random_secret
-   PORT=5000
-   FRONTEND_URLS=http://localhost:3000,http://localhost:5173,https://kid-ride.vercel.app
-   RATE_LIMIT_WINDOW_MS=900000
-   RATE_LIMIT_MAX_REQUESTS=300
-   AUTH_RATE_LIMIT_WINDOW_MS=900000
-   AUTH_RATE_LIMIT_MAX_ATTEMPTS=20
-   RIDE_REQUEST_RATE_LIMIT_WINDOW_MS=60000
-   RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS=10
-   ```
-4. Start the server:
-   ```bash
-   npm start
-   ```
+## Environment
 
-## Environment Variables
-- `SUPABASE_URL` required, project URL.
-- `SUPABASE_ANON_KEY` required, used for password login.
-- `SUPABASE_SERVICE_ROLE_KEY` required, used for admin auth actions and server-side table access.
-- `JWT_SECRET` required, signing key for KidRide session tokens returned to the frontend.
-- `PORT` optional, defaults to `5000`.
-- `FRONTEND_URLS` optional, comma-separated CORS allowlist for HTTP + Socket.IO.
-- `RATE_LIMIT_WINDOW_MS` optional, global limit window in ms (default `900000`).
-- `RATE_LIMIT_MAX_REQUESTS` optional, global max requests per window (default `300`).
-- `AUTH_RATE_LIMIT_WINDOW_MS` optional, auth routes window in ms (default `900000`).
-- `AUTH_RATE_LIMIT_MAX_ATTEMPTS` optional, max auth attempts per window (default `20`).
-- `RIDE_REQUEST_RATE_LIMIT_WINDOW_MS` optional, ride request window in ms (default `60000`).
-- `RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS` optional, max ride requests per window (default `10`).
+| Variable | Purpose |
+| --- | --- |
+| `SUPABASE_URL` | Supabase project URL |
+| `SUPABASE_ANON_KEY` | Password login client key |
+| `SUPABASE_SERVICE_ROLE_KEY` | Backend-only auth administration, database, and storage access |
+| `JWT_SECRET` | Strong private secret for KidRide JWTs; tokens expire after 30 days |
+| `FRONTEND_URLS` | Comma-separated allowed web origins |
+| `NODE_ENV` | Set to `production` to use database-backed rate counters |
+| `TRUST_PROXY_HOPS` | Verified trusted proxy count; defaults to 1 on Vercel, 0 elsewhere |
+| `SERVICE_PRICES_JSON` | Approved positive USD fixed fares by service type |
+| `GEMINI_API_KEY` | Backend-only Gemini key for safety chat |
+| `EXPO_ACCESS_TOKEN` | Optional Expo server access token when enhanced push security is enabled |
+| `CRON_SECRET` | Private bearer secret for scheduled receipt processing |
+| `PORT` | Local listener port, default 5000 |
 
-## Authentication Model
-- Supabase Auth stores credentials and validates email/password.
-- The backend still issues a 30-day KidRide JWT after login/register so the frontend contract stays the same.
-- Protected routes require:
-  - Header: `Authorization: Bearer <token>`
+Supported fare keys: `pickup_only`, `dropoff_only`, `pickup_and_dropoff`, `stay_with_child_and_dropoff`. Values must be positive numbers with at most two decimal places. Missing/malformed pricing returns 503 for that service; no default free ride is created. This is fixed-service pricing, not distance-based fare calculation, payment collection, or payouts.
 
-## Supabase Tables
-- `profiles`
-  - App-facing user record keyed to `auth.users.id`
-- `children`
-  - Child profiles owned by a parent profile
-- `rides`
-  - Ride requests, assignments, and trip lifecycle data
-- `ride_declines`
-  - Per-driver dismiss records so declined open requests do not immediately reappear
+Optional throttle controls: `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS` (default 1000 per 15 minutes), `AUTH_RATE_LIMIT_WINDOW_MS`, `AUTH_RATE_LIMIT_MAX_ATTEMPTS` (20 per 15 minutes), `RIDE_REQUEST_RATE_LIMIT_WINDOW_MS`, and `RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS` (10 per minute). IPs come from Express's configured trusted-proxy chain, not arbitrary forwarded header values. Production counters are shared through a database RPC and fail closed if unavailable.
 
-## API Endpoints
+Never put service-role, JWT, Gemini, cron, or Expo server secrets in client bundles. Revoke any Gemini key previously embedded in the web frontend.
 
-### Auth (`/api/auth`)
-- `POST /register`
-  - Body: `name`, `email`, `password`, optional `role` (`parent|driver|admin`)
-- `POST /login`
-  - Body: `email`, `password`
-- `GET /me` (protected)
-  - Returns current authenticated user payload
+## Database setup and deployment order
 
-### Users (`/api/users`) (all protected)
-- `GET /profile`
-  - Returns user profile
-- `PUT /profile`
-  - Body (optional): `name`, `phone`, `photoUrl`
-- `GET /children`
-  - Returns current user children array
-- `POST /children`
-  - Body: `name`, `age`, optional `notes`, `photoUrl`
-- `POST /driver-application`
-  - Body: optional `phone`, and vehicle either as `vehicle` object or individual `make/model/year/color/plate`
-  - Sets `driverApplicationStatus` to `pending`
+1. For a new project, run `supabase/schema.sql` first.
+2. Apply `supabase/migrations/2026-10-04_security_services.sql` for new and existing projects. It adds private service tables, GPS data, active-ride uniqueness, distributed rate limiting, and the private verification bucket. It removes direct client write permissions.
+3. If unique-index creation fails because an account has multiple active rides, the migration aborts. Review those rides with their participants and resolve them deliberately before retrying; the migration never silently cancels live trips.
+4. Configure environment variables and operator-approved fare values, then deploy this backend.
+5. Deploy the coordinated web/mobile clients. Old clients do not support quotes and signed verification uploads.
+6. Configure both mobile EAS projects' APNs/FCM credentials and Maps SDK keys. Test notifications and foreground GPS on physical devices.
+7. Schedule `GET /api/notification-receipts` every 15 minutes with `Authorization: Bearer <CRON_SECRET>`. Keep this secret on the scheduler/server only.
 
-### Rides (`/api/rides`) (all protected)
-- `POST /request`
-  - Body supports:
-    - `childId` or `child`
-    - `pickup` or `pickupLocation`
-    - `dropoff` or `dropoffLocation`
-    - `price`
-    - optional `pickupTime`, `serviceType`
-- `GET /open`
-  - Driver/Admin only
-  - Query: `limit` (default `20`, max `100`)
-- `GET /active`
-  - Returns latest non-terminal ride for parent or driver
-- `GET /`
-  - Query:
-    - `scope=all|active|upcoming|past`
-    - `limit` (default `50`, max `100`)
-- `GET /:id`
-  - Parent, assigned driver, or admin
-- `PUT /:id/accept`
-  - Driver/Admin only
-  - Assigns current driver and sets status to `driver_assigned`
-- `PUT /:id/decline`
-  - Driver only
-  - Persists a dismiss action for that driver on an open request
-- `PUT /:id/status`
-  - Driver/Admin only
-  - Body: `status`
-- `PUT /:id/cancel`
-  - Parent, assigned driver, or admin
+Existing Supabase grants/policies must be reviewed if you have customized them beyond the repository schema. Admin accounts are provisioned through controlled database administration; **public registration never creates admins**. Review pre-existing admin accounts because earlier versions permitted public admin signup.
 
-## Ride Statuses
-- `requested`
-- `searching_driver`
-- `driver_assigned`
-- `driver_arrived_at_pickup`
-- `child_picked_up`
-- `completed`
-- `cancelled`
+## API
 
-## Driver Status Transition Rules
-- `driver_assigned` -> `driver_arrived_at_pickup` or `cancelled`
-- `driver_arrived_at_pickup` -> `child_picked_up` or `cancelled`
-- `child_picked_up` -> `completed`
+All paths below are relative to `/api`. Except registration/login and the scheduler endpoint, requests require `Authorization: Bearer <KidRide JWT>`.
 
-## Socket.IO Events
-Server events are still configured in `server.js`.
+| Method and path | Access / purpose |
+| --- | --- |
+| `POST /auth/register` | Public; `name`, `email`, `password`, role `parent` or `driver` |
+| `POST /auth/login` | Public password login |
+| `GET /auth/me` | Current profile |
+| `GET /users/profile`, `PUT /users/profile` | Own profile; editable name, phone, photo URL only |
+| `GET /users/children`, `POST /users/children` | Own child profiles |
+| `POST /users/verification-upload` | Driver; `kind`, `contentType`; returns `path`, `signedUrl` |
+| `POST /users/driver-application` | Driver; phone, complete vehicle details, six uploaded `documents` paths |
+| `GET /users/driver-applications/:id` | Admin; five-minute signed document download URLs |
+| `PUT /users/driver-applications/:id/review` | Admin; approve/reject a pending application after actual verification |
+| `POST /users/push-token`, `DELETE /users/push-token` | Register/remove own device token |
+| `POST /rides/quote` | Parent; `serviceType`; returns server fare and USD currency |
+| `POST /rides/request` | Parent; owned `childId`, pickup/dropoff, pickupTime, serviceType, quotedPrice |
+| `GET /rides` | Own rides; admin can list all; scope and capped limit filters |
+| `GET /rides/open` | Approved verified driver; redacted available offers; admin access allowed |
+| `GET /rides/active` | Latest nonterminal ride belonging to the caller |
+| `GET /rides/:id` | Ride participant or admin |
+| `PUT /rides/:id/accept` | Approved verified driver; atomic assignment, one active trip per driver |
+| `PUT /rides/:id/decline` | Approved verified driver; dismiss open offer |
+| `PUT /rides/:id/status` | Assigned driver; valid transition only; controlled admin override |
+| `PUT /rides/:id/cancel` | Parent, assigned driver, or admin; ordinary cancellation blocked after pickup |
+| `PUT /rides/:id/location` | Assigned approved driver; latitude, longitude, optional accuracy |
+| `POST /safety-chat` | Signed-in guidance request, up to 2000 characters; per-user throttled |
+| `GET /notification-receipts` | Scheduler bearer secret; Expo receipt processing |
 
-### Client to Server
-- `join_driver_room`
-- `request_ride`
-- `accept_ride`
-- `update_location`
+## Ride authorization and concurrency
 
-### Server to Client
-- `ride_available`
-- `ride_accepted`
-- `driver_location`
-- `ride_status_updated`
+A driver must have both `is_verified_driver=true` and `driver_application_status=approved` to see offers or accept. Booking checks child ownership and recomputes server fares. Active-ride unique indexes protect against simultaneous double booking. Acceptance uses an atomic unassigned/status predicate. Status/cancellation updates compare the saved status so stale concurrent requests receive 409 instead of overwriting newer state. Terminal rides cannot be reopened.
 
-## Notes for Frontend Integration
-- The frontend still receives the same payload shape for:
-  - `id`, `name`, `email`, `role`, `children`, `driverApplicationStatus`
-  - ride fields like `id/_id`, `child`, `driver`, `pickupLocation`, `dropoffLocation`, `status`, `serviceType`
-- This lets the React app keep calling the same REST endpoints while Supabase replaces MongoDB under the hood.
+Open offers omit child identifiers, parent identity, trip codes, and safe words. Assigned participants receive safety credentials. Trip codes and safe words use cryptographic randomness. Socket.IO connections require a valid JWT, join only server-selected rooms, and cannot submit ride/location writes; clients use the REST API.
 
-## Operational Notes
-- No automated backend test suite is configured yet.
-- The tracked `.env` file should only contain placeholders; use real project secrets locally or in deployment config.
+## Driver verification
+
+The private `driver-verification` bucket accepts JPEG, PNG, and PDF files up to 5 MB. Required kinds: `license`, `insurance`, `registration`, `photo_front`, `photo_left`, `photo_right`. Photos must be images. Signed upload paths are user/kind scoped. Application submission checks ownership, existence, MIME, and size for every object.
+
+Files remain private. Only admins receive short-lived review links. Photos support manual review, **not automated liveness detection**. This repository does not integrate a background-check provider. Approval must follow the operator's actual verification process; submitting an application grants no ride access. Plan a private-document retention/deletion process appropriate to your operation.
+
+Application review: fetch the private document links first, then include the returned `submittedAt` with `status` in the review request. A changed submission returns 409; submission and review are serialized in the database.
+
+## GPS, notifications, and safety
+
+Driver coordinates are stored on the ride with server timestamps and returned only to authorized participants. Clients show missing/stale GPS explicitly. Current mobile/browser reporting is foreground-only; background or terminated-app tracking requires additional native infrastructure and device testing.
+
+Saved status changes trigger bounded Expo push attempts to participant devices. Delivery failures do not undo rides. Tickets are stored for scheduled receipt checks; `DeviceNotRegistered` tokens are removed. Push notifications are best effort, not guaranteed delivery.
+
+Safety chat uses a server-side Gemini request and is general guidance only. It cannot dispatch emergency responders, verify drivers, or guarantee safety. SOS dialing is a client feature; configure the operating region's emergency number in the mobile app.
+
+## Validation and limitations
+
+`npm test` runs regression checks for signup roles, ownership, approval, fare authority, credential redaction, coordinate validation, status/cancellation concurrency, and throttling. Validate the migration in staging, then exercise the complete ride flow, signed uploads, push credentials/receipts, and physical-device GPS before operational use.
+
+Payment processing, driver payouts, automated background checks, automated liveness verification, carpool publishing, and continuous background GPS are not implemented. This code update does not itself deploy database changes or provision third-party credentials.

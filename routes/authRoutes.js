@@ -16,7 +16,7 @@ const authLimiter = createRateLimiter({
   keyPrefix: 'auth'
 });
 
-const VALID_ROLES = new Set(['parent', 'driver', 'admin']);
+const VALID_ROLES = new Set(['parent', 'driver']);
 const normalizeEmail = (value = '') => value.trim().toLowerCase();
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
@@ -84,7 +84,7 @@ router.post('/register', authLimiter, async (req, res) => {
   }
 
   if (!VALID_ROLES.has(normalizedRole)) {
-    return res.status(400).json({ message: 'role must be parent, driver, or admin' });
+    return res.status(400).json({ message: 'role must be parent or driver' });
   }
 
   let createdUserId = null;
