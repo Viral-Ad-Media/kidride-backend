@@ -1,19 +1,9 @@
 const parsePositiveInt = (value, fallback) => {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : fallback;
 };
 
 const getClientIdentifier = (req) => {
-  const forwardedFor = req.headers['x-forwarded-for'];
-  if (typeof forwardedFor === 'string' && forwardedFor.trim()) {
-    return forwardedFor.split(',')[0].trim();
-  }
-
-  const realIp = req.headers['x-real-ip'];
-  if (typeof realIp === 'string' && realIp.trim()) {
-    return realIp.trim();
-  }
-
   if (req.ip) {
     return req.ip;
   }
@@ -30,7 +20,8 @@ const createRateLimiter = ({
   max = 100,
   message = 'Too many requests. Please try again later.',
   keyPrefix = 'global',
-  keyGenerator
+  keyGenerator,
+  consume
 } = {}) => {
   const store = new Map();
   const cleanupIntervalMs = Math.min(windowMs, 60 * 1000);
@@ -49,7 +40,7 @@ const createRateLimiter = ({
     interval.unref();
   }
 
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const now = Date.now();
     let clientKey;
 
@@ -75,6 +66,12 @@ const createRateLimiter = ({
     entry.count += 1;
     store.set(key, entry);
 
+    if (consume || process.env.NODE_ENV === 'production') {
+      try {
+        const persistentCount = consume ? await consume(key, windowMs) : await require('../lib/rateLimitStore').consume(key, windowMs);
+        entry.count = persistentCount;
+      } catch { return res.status(503).json({ message: 'Request protection unavailable. Please try again shortly.' }); }
+    }
     const remaining = Math.max(0, max - entry.count);
     const retryAfterSeconds = Math.max(1, Math.ceil((entry.resetTime - now) / 1000));
 

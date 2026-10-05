@@ -182,3 +182,6 @@ on public.ride_declines
 for insert
 to authenticated
 with check (auth.uid() = driver_id);
+
+-- API owns mutations; service migration installs service tables and storage.
+revoke insert, update, delete on public.profiles, public.children, public.rides, public.ride_declines from anon, authenticated;

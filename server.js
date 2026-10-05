@@ -12,13 +12,13 @@ connectDB();
 
 const app = express();
 const server = http.createServer(app);
-app.set('trust proxy', 1);
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || (process.env.VERCEL ? 1 : 0)));
 const allowedOrigins = (process.env.FRONTEND_URLS || 'http://localhost:3000,http://localhost:5173')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
 const globalRateLimitWindowMs = parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000);
-const globalRateLimitMaxRequests = parsePositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 300);
+const globalRateLimitMaxRequests = parsePositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 1000);
 const globalRateLimiter = createRateLimiter({
   windowMs: globalRateLimitWindowMs,
   max: globalRateLimitMaxRequests,
@@ -45,6 +45,8 @@ app.use(globalRateLimiter);
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/users', require('./routes/userRoutes'));
 app.use('/api/rides', require('./routes/rideRoutes'));
+app.use('/api/safety-chat', require('./routes/safetyRoutes'));
+app.use('/api/notification-receipts', require('./routes/receiptRoutes'));
 
 // Socket.io Setup
 const io = new Server(server, {
@@ -58,31 +60,23 @@ const io = new Server(server, {
 // Pass io to routes via request object if needed, or handle here
 app.set('io', io);
 
-io.on('connection', (socket) => {
-  console.log('User Connected:', socket.id);
-
-  socket.on('join_driver_room', () => {
-    socket.join('drivers');
-  });
-
-  socket.on('request_ride', (data) => {
-    // Broadcast to all drivers
-    socket.to('drivers').emit('ride_available', data);
-  });
-
-  socket.on('accept_ride', (data) => {
-    // Notify specific parent
-    io.to(data.parentId).emit('ride_accepted', data);
-  });
-  
-  socket.on('update_location', (data) => {
-    // Send live coordinates to parent
-    io.to(data.parentId).emit('driver_location', data.coords);
-  });
-
-  socket.on('disconnect', () => {
-    console.log('User Disconnected');
-  });
+const jwt = require('jsonwebtoken');
+const { fetchUserById } = require('./lib/repository');
+const { isApprovedDriver } = require('./lib/security');
+io.use(async (socket, next) => {
+  try {
+    const decoded = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
+    const user = await fetchUserById(decoded.id);
+    if (!user) throw new Error('Unknown account');
+    socket.data.user = user;
+    next();
+  } catch { next(new Error('Not authorized')); }
+});
+io.on('connection', socket => {
+  const user = socket.data.user;
+  socket.join(user.id);
+  if (isApprovedDriver(user)) socket.join('drivers');
+  // Ride writes and coordinates use authenticated REST routes only.
 });
 
 const PORT = process.env.PORT || 5000;
