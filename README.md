@@ -29,6 +29,7 @@ The local server defaults to port 5000. Configure the environment before startin
 | `GEMINI_API_KEY` | Backend-only Gemini key for safety chat |
 | `EXPO_ACCESS_TOKEN` | Optional Expo server access token when enhanced push security is enabled |
 | `CRON_SECRET` | Private bearer secret for scheduled receipt processing |
+| `EMAIL_REDIRECT_URL` | Optional page the signup confirmation link returns to (must be in Supabase Auth redirect URLs) |
 | `PORT` | Local listener port, default 5000 |
 
 Supported fare keys: `pickup_only`, `dropoff_only`, `pickup_and_dropoff`, `stay_with_child_and_dropoff`. Values must be positive numbers with at most two decimal places. Missing/malformed pricing returns 503 for that service; no default free ride is created. This is fixed-service pricing, not distance-based fare calculation, payment collection, or payouts.
@@ -42,10 +43,11 @@ Never put service-role, JWT, Gemini, cron, or Expo server secrets in client bund
 1. For a new project, run `supabase/schema.sql` first.
 2. Apply `supabase/migrations/2026-10-04_security_services.sql` for new and existing projects. It adds private service tables, GPS data, active-ride uniqueness, distributed rate limiting, and the private verification bucket. It removes direct client write permissions.
 3. If unique-index creation fails because an account has multiple active rides, the migration aborts. Review those rides with their participants and resolve them deliberately before retrying; the migration never silently cancels live trips.
-4. Configure environment variables and operator-approved fare values, then deploy this backend.
-5. Deploy the coordinated web/mobile clients. Old clients do not support quotes and signed verification uploads.
-6. Configure both mobile EAS projects' APNs/FCM credentials and Maps SDK keys. Test notifications and foreground GPS on physical devices.
-7. Schedule `GET /api/notification-receipts` every 15 minutes with `Authorization: Bearer <CRON_SECRET>`. Keep this secret on the scheduler/server only.
+4. In Supabase Auth settings, enable **Confirm email** and configure SMTP; registration depends on it to prove email ownership.
+5. Configure environment variables and operator-approved fare values, then deploy this backend.
+6. Deploy the coordinated web/mobile clients. Old clients do not support quotes and signed verification uploads.
+7. Configure both mobile EAS projects' APNs/FCM credentials and Maps SDK keys. Test notifications and foreground GPS on physical devices.
+8. Schedule `GET /api/notification-receipts` every 15 minutes with `Authorization: Bearer <CRON_SECRET>`. Keep this secret on the scheduler/server only.
 
 Existing Supabase grants/policies must be reviewed if you have customized them beyond the repository schema. Admin accounts are provisioned through controlled database administration; **public registration never creates admins**. Review pre-existing admin accounts because earlier versions permitted public admin signup.
 
@@ -55,8 +57,8 @@ All paths below are relative to `/api`. Except registration/login and the schedu
 
 | Method and path | Access / purpose |
 | --- | --- |
-| `POST /auth/register` | Public; `name`, `email`, `password`, role `parent` or `driver` |
-| `POST /auth/login` | Public password login |
+| `POST /auth/register` | Public; `name`, `email`, `password`, role `parent` or `driver`. Returns 202 `{ requiresEmailVerification: true }` and no token; Supabase emails a confirmation link |
+| `POST /auth/login` | Public password login; 403 `code: email_not_confirmed` until the email is confirmed |
 | `GET /auth/me` | Current profile |
 | `GET /users/profile`, `PUT /users/profile` | Own profile; editable name, phone, photo URL only |
 | `GET /users/children`, `POST /users/children` | Own child profiles |

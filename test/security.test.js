@@ -69,6 +69,37 @@ test('public signup rejects admin role before creating an auth account', async (
 test('assigned driver status writes compare the previous state and surface a stale-update conflict', async () => {
   let argumentsSeen;
   const handlers=routes({fetchRideRowById:async()=>({id:'ride',driver_id:'driver',status:'driver_assigned'}),updateRideRow:async(...args)=>{argumentsSeen=args;throw Object.assign(Error('changed'),{status:409});}});
-  const res=response();await handlers['put /:id/status']({params:{id:'ride'},body:{status:'driver_arrived_at_pickup'},user:{id:'driver',role:'driver'}},res);
+  const res=response();await handlers['put /:id/status']({params:{id:'ride'},body:{status:'driver_arrived_at_pickup'},user:{id:'driver',role:'driver',isVerifiedDriver:true,driverApplicationStatus:'approved'}},res);
   assert.equal(res.code,409);assert.equal(argumentsSeen[2],'driver_assigned');assert.equal(argumentsSeen[3],'driver');
+});
+test('assigned driver who is no longer approved cannot advance ride status', async () => {
+  let updated=false;
+  const handlers=routes({fetchRideRowById:async()=>({id:'ride',driver_id:'driver',status:'driver_assigned'}),updateRideRow:async()=>{updated=true;}});
+  for (const user of [{id:'driver',role:'driver',isVerifiedDriver:false,driverApplicationStatus:'pending'},{id:'driver',role:'driver',isVerifiedDriver:true,driverApplicationStatus:'rejected'}]) {
+    const res=response();await handlers['put /:id/status']({params:{id:'ride'},body:{status:'child_picked_up'},user},res);assert.equal(res.code,403);
+  }
+  assert.equal(updated,false);
+});
+function authHandlers(supabaseAuth, repository = {}, supabaseAdmin = {}) {
+  const handlers={};
+  load('routes/authRoutes.js', {express:{Router:()=>({post:(url,...h)=>{handlers[url]=h.at(-1);},get(){}})},jsonwebtoken:{sign:()=>'token'},'../middleware/authMiddleware':{protect(){}},'../middleware/rateLimitMiddleware':{createRateLimiter:()=>()=>{},parsePositiveInt:(_,fallback)=>fallback},'../config/supabase':{supabaseAuth,supabaseAdmin},'../lib/repository':repository});
+  return handlers;
+}
+test('registration requires email confirmation and issues no token', async () => {
+  let profile;
+  const handlers=authHandlers({auth:{signUp:async()=>({data:{user:{id:'u1',identities:[{}]}},error:null})}},{upsertProfileRow:async row=>{profile=row;}});
+  const res=response();await handlers['/register']({body:{name:'Pat',email:'Pat@Example.test',password:'password',role:'parent'}},res);
+  assert.equal(res.code,202);assert.equal(res.body.requiresEmailVerification,true);assert.equal(res.body.token,undefined);assert.equal(profile.email,'pat@example.test');
+});
+test('registration for an existing email looks identical and writes no profile', async () => {
+  let wrote=false;
+  const handlers=authHandlers({auth:{signUp:async()=>({data:{user:{id:'existing',identities:[]}},error:null})}},{upsertProfileRow:async()=>{wrote=true;}});
+  const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password'}},res);
+  assert.equal(res.code,202);assert.equal(wrote,false);
+});
+test('login is refused until the email is confirmed', async () => {
+  for (const result of [{data:{user:null},error:{code:'email_not_confirmed'}},{data:{user:{id:'u1',email_confirmed_at:null}},error:null}]) {
+    const handlers=authHandlers({auth:{signInWithPassword:async()=>result}});
+    const res=response();await handlers['/login']({body:{email:'pat@example.test',password:'password'}},res);assert.equal(res.code,403);assert.equal(res.body.code,'email_not_confirmed');
+  }
 });
