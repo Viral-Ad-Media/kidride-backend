@@ -17,6 +17,10 @@ const authLimiter = createRateLimiter({
 });
 
 const VALID_ROLES = new Set(['parent', 'driver']);
+const VERIFICATION_REQUIRED_RESPONSE = {
+  requiresEmailVerification: true,
+  message: 'Check your email for a confirmation link, then log in.'
+};
 const normalizeEmail = (value = '') => value.trim().toLowerCase();
 
 const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
@@ -90,13 +94,17 @@ router.post('/register', authLimiter, async (req, res) => {
   let createdUserId = null;
 
   try {
-    const { data, error } = await supabaseAdmin.auth.admin.createUser({
+    // signUp (unlike admin.createUser) leaves the email unconfirmed and has
+    // Supabase send a confirmation link, so ownership is proven before login.
+    const { data, error } = await supabaseAuth.auth.signUp({
       email: normalizedEmail,
       password,
-      email_confirm: true,
-      user_metadata: {
-        name: normalizedName,
-        role: normalizedRole
+      options: {
+        data: {
+          name: normalizedName,
+          role: normalizedRole
+        },
+        ...(process.env.EMAIL_REDIRECT_URL ? { emailRedirectTo: process.env.EMAIL_REDIRECT_URL } : {})
       }
     });
 
@@ -112,16 +120,20 @@ router.post('/register', authLimiter, async (req, res) => {
       return res.status(400).json({ message: 'Invalid user data' });
     }
 
-    createdUserId = data.user.id;
+    // Supabase returns a user without identities for an already-registered
+    // email; respond identically so registration cannot enumerate accounts.
+    const isNewUser = Array.isArray(data.user.identities) && data.user.identities.length > 0;
+    if (isNewUser) {
+      createdUserId = data.user.id;
+      await upsertProfileRow(createProfilePayload({
+        id: data.user.id,
+        name: normalizedName,
+        email: normalizedEmail,
+        role: normalizedRole
+      }));
+    }
 
-    await upsertProfileRow(createProfilePayload({
-      id: data.user.id,
-      name: normalizedName,
-      email: normalizedEmail,
-      role: normalizedRole
-    }));
-
-    return res.status(201).json(await resolveAuthenticatedUser(data.user.id, true));
+    return res.status(202).json(VERIFICATION_REQUIRED_RESPONSE);
   } catch (error) {
     if (createdUserId) {
       await supabaseAdmin.auth.admin.deleteUser(createdUserId);
@@ -144,6 +156,10 @@ router.post('/login', authLimiter, async (req, res) => {
       email: normalizedEmail,
       password
     });
+
+    if (error?.code === 'email_not_confirmed' || (data?.user && !data.user.email_confirmed_at)) {
+      return res.status(403).json({ message: 'Please confirm your email address before logging in.', code: 'email_not_confirmed' });
+    }
 
     if (error || !data.user) {
       return res.status(401).json({ message: 'Invalid email or password' });

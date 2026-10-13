@@ -409,6 +409,9 @@ router.put('/:id/status', protect, async (req, res) => {
       if (!ride.driver_id || ride.driver_id !== req.user.id) {
         return res.status(403).json({ message: 'Only the assigned driver can update ride status' });
       }
+      if (!isApprovedDriver(req.user)) {
+        return res.status(403).json({ message: 'Approved driver required' });
+      }
       const allowedNextStatuses = DRIVER_STATUS_TRANSITIONS[ride.status] || [];
       if (!allowedNextStatuses.includes(status)) {
         return res.status(409).json({
