@@ -15,6 +15,11 @@ const protect = async (req, res, next) => {
       return res.status(401).json({ message: 'Not authorized, user not found' });
     }
 
+    // Tokens issued before the last logout-everywhere carry an older version.
+    if ((Number(decoded.tv) || 0) !== user.tokenVersion) {
+      return res.status(401).json({ message: 'Session expired. Please log in again.' });
+    }
+
     req.user = user;
     return next();
   } catch (error) {

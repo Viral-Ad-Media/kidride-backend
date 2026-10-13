@@ -15,6 +15,8 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+// Express 5 leaves req.body undefined when no JSON body was parsed.
+app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next(); });
 
 // Load all API dependencies atomically. Missing config must not kill the function.
 let apiRouter;
@@ -73,7 +75,7 @@ if (require.main === module && !process.env.VERCEL) {
       try {
         const decoded = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
         const user = await fetchUserById(decoded.id);
-        if (!user) throw new Error('Unknown account');
+        if (!user || (Number(decoded.tv) || 0) !== user.tokenVersion) throw new Error('Unknown account');
         socket.data.user = user;
         next();
       } catch { next(new Error('Not authorized')); }

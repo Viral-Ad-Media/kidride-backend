@@ -103,3 +103,37 @@ test('login is refused until the email is confirmed', async () => {
     const res=response();await handlers['/login']({body:{email:'pat@example.test',password:'password'}},res);assert.equal(res.code,403);assert.equal(res.body.code,'email_not_confirmed');
   }
 });
+const { sendError } = require('../lib/http');
+test('sendError hides internal error text but passes through deliberate 4xx/503 and unique-violations', () => {
+  const originalError=console.error; console.error=()=>{};
+  try {
+    let res=response(); sendError(res, new Error('relation "rides" violates constraint rides_child_id_fkey')); assert.equal(res.code,500); assert.equal(res.body.message,'Request failed');
+    res=response(); sendError(res, Object.assign(new Error('Ride changed. Refresh and try again.'),{status:409})); assert.equal(res.code,409); assert.match(res.body.message,/Ride changed/);
+    res=response(); sendError(res, Object.assign(new Error('Pricing unavailable'),{status:503})); assert.equal(res.code,503);
+    res=response(); sendError(res, Object.assign(new Error('duplicate key'),{code:'23505'})); assert.equal(res.code,409);
+  } finally { console.error=originalError; }
+});
+test('terminal status updates and cancellations clear the driver GPS fix and notify the driver too', async () => {
+  const emitted=[]; let updates;
+  const io={ to:(rooms)=>({ emit:(event)=>emitted.push([rooms,event]) }) };
+  const handlers=routes({fetchRideRowById:async()=>({id:'ride',parent_id:'parent',driver_id:'driver',status:'child_picked_up'}),updateRideRow:async(_id,changes)=>{updates=changes;return {id:'ride',parent_id:'parent',driver_id:'driver',status:changes.status,price:1};}, formatRide:(r)=>r});
+  let res=response();await handlers['put /:id/status']({params:{id:'ride'},body:{status:'completed'},user:{id:'driver',role:'driver',isVerifiedDriver:true,driverApplicationStatus:'approved'},app:{get:()=>io}},res);
+  assert.equal(res.code,200); assert.equal(updates.driver_location,null); assert.equal(JSON.stringify(emitted.at(-1)[0]),JSON.stringify(['parent','driver']));
+  const cancel=routes({fetchRideRowById:async()=>({id:'ride',parent_id:'parent',driver_id:'driver',status:'driver_assigned'}),updateRideRow:async(_id,changes)=>{updates=changes;return {id:'ride',parent_id:'parent',driver_id:'driver',status:'cancelled',price:1};}, formatRide:(r)=>r});
+  res=response();await cancel['put /:id/cancel']({params:{id:'ride'},user:{id:'parent',role:'parent'},app:{get:()=>null}},res);
+  assert.equal(res.code,200); assert.equal(updates.driver_location,null);
+});
+test('protect rejects tokens whose version predates a logout-everywhere', async () => {
+  const { protect } = load('middleware/authMiddleware.js', { jsonwebtoken:{ verify:()=>({id:'u1',tv:0}) }, '../lib/repository':{ fetchUserById: async()=>({id:'u1',tokenVersion:1}) } });
+  let nextCalled=false; const res=response();
+  await protect({headers:{authorization:'Bearer x'}},res,()=>{nextCalled=true;});
+  assert.equal(res.code,401); assert.equal(nextCalled,false);
+  const { protect: fresh } = load('middleware/authMiddleware.js', { jsonwebtoken:{ verify:()=>({id:'u1',tv:1}) }, '../lib/repository':{ fetchUserById: async()=>({id:'u1',tokenVersion:1}) } });
+  nextCalled=false; await fresh({headers:{authorization:'Bearer x'}},response(),()=>{nextCalled=true;}); assert.equal(nextCalled,true);
+});
+test('login rebuilds a missing profile from auth metadata with a non-admin role', async () => {
+  let written;
+  const handlers=authHandlers({auth:{signInWithPassword:async()=>({data:{user:{id:'u9',email:'Dash@Example.test',email_confirmed_at:'2026-01-01',user_metadata:{name:'Dash',role:'admin'}}},error:null})}},{fetchUserById:async()=>written?{id:'u9',name:'Dash',email:'dash@example.test',role:written.role,tokenVersion:0}:null,upsertProfileRow:async row=>{written=row;}});
+  const res=response();await handlers['/login']({body:{email:'dash@example.test',password:'pw'}},res);
+  assert.equal(res.code,200); assert.equal(written.role,'parent'); assert.equal(res.body.token,'token');
+});
