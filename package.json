@@ -2,7 +2,7 @@
   "name": "kidride-backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "test": "node --test"
@@ -18,5 +18,8 @@
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.2",
     "socket.io": "^4.8.1"
+  },
+  "engines": {
+    "node": "22.x"
   }
 }

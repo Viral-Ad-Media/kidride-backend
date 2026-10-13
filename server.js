@@ -1,84 +1,88 @@
-const express = require('express');
-const http = require('http');
 const dotenv = require('dotenv');
+dotenv.config({ quiet: true });
+const express = require('express');
 const cors = require('cors');
-const { Server } = require('socket.io');
 const connectDB = require('./config/db');
 const { createRateLimiter, parsePositiveInt } = require('./middleware/rateLimitMiddleware');
 
-// Load config
-dotenv.config();
-connectDB();
-
 const app = express();
-const server = http.createServer(app);
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || (process.env.VERCEL ? 1 : 0)));
 const allowedOrigins = (process.env.FRONTEND_URLS || 'http://localhost:3000,http://localhost:5173')
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-const globalRateLimitWindowMs = parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000);
-const globalRateLimitMaxRequests = parsePositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 1000);
-const globalRateLimiter = createRateLimiter({
-  windowMs: globalRateLimitWindowMs,
-  max: globalRateLimitMaxRequests,
-  message: 'Too many requests. Please try again later.',
-  keyPrefix: 'global'
-});
-
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error('Not allowed by CORS'));
-  },
+  .split(',').map(origin => origin.trim()).filter(Boolean);
+app.use(cors({
+  origin: (origin, callback) => !origin || allowedOrigins.includes(origin)
+    ? callback(null, true) : callback(new Error('Not allowed by CORS')),
   credentials: true
-};
-
-// Middleware
-app.use(cors(corsOptions));
+}));
 app.use(express.json());
-app.use(globalRateLimiter);
 
-// Routes
-app.use('/api/auth', require('./routes/authRoutes'));
-app.use('/api/users', require('./routes/userRoutes'));
-app.use('/api/rides', require('./routes/rideRoutes'));
-app.use('/api/safety-chat', require('./routes/safetyRoutes'));
-app.use('/api/notification-receipts', require('./routes/receiptRoutes'));
+// Load all API dependencies atomically. Missing config must not kill the function.
+let apiRouter;
+try {
+  connectDB();
+  const router = express.Router();
+  router.use(createRateLimiter({
+    windowMs: parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
+    max: parsePositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 1000),
+    message: 'Too many requests. Please try again later.', keyPrefix: 'global'
+  }));
+  router.use('/auth', require('./routes/authRoutes'));
+  router.use('/users', require('./routes/userRoutes'));
+  router.use('/rides', require('./routes/rideRoutes'));
+  router.use('/safety-chat', require('./routes/safetyRoutes'));
+  router.use('/notification-receipts', require('./routes/receiptRoutes'));
+  apiRouter = router;
+} catch (error) {
+  // Variable names and stack traces belong in runtime logs, never HTTP responses.
+  console.error('KidRide API initialization failed:', error);
+}
 
-// Socket.io Setup
-const io = new Server(server, {
-  cors: {
-    origin: allowedOrigins,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    credentials: true
+const status = (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.status(apiRouter ? 200 : 503).json({
+    service: 'KidRide API', status: apiRouter ? 'configured' : 'unavailable',
+    database: 'not_checked'
+  });
+};
+app.get('/', status);
+app.get('/health', (_req, res) => res.set('Cache-Control', 'no-store').json({ status: 'alive' }));
+app.get('/api/health', status);
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
+app.use('/api', apiRouter || ((_req, res) => res.status(503).json({ message: 'Service configuration unavailable. Contact support.' })));
+app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
+app.use((error, _req, res, _next) => {
+  if (res.headersSent) return _next(error);
+  const statusCode = error.status >= 400 && error.status < 500 ? error.status : 500;
+  res.status(statusCode).json({ message: statusCode === 400 ? 'Invalid request body' : 'Request failed' });
+});
+
+// Vercel calls the exported Express handler; importing it must not open a port.
+module.exports = app;
+if (require.main === module && !process.env.VERCEL) {
+  const http = require('http');
+  const server = http.createServer(app);
+  // This deployment uses REST polling; attach Socket.IO only on the local Node host.
+  if (apiRouter) {
+    const { Server } = require('socket.io');
+    const jwt = require('jsonwebtoken');
+    const { fetchUserById } = require('./lib/repository');
+    const { isApprovedDriver } = require('./lib/security');
+    const io = new Server(server, { cors: { origin: allowedOrigins, credentials: true } });
+    app.set('io', io);
+    io.use(async (socket, next) => {
+      try {
+        const decoded = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
+        const user = await fetchUserById(decoded.id);
+        if (!user) throw new Error('Unknown account');
+        socket.data.user = user;
+        next();
+      } catch { next(new Error('Not authorized')); }
+    });
+    io.on('connection', socket => {
+      const user = socket.data.user;
+      socket.join(user.id);
+      if (isApprovedDriver(user)) socket.join('drivers');
+    });
   }
-});
-
-// Pass io to routes via request object if needed, or handle here
-app.set('io', io);
-
-const jwt = require('jsonwebtoken');
-const { fetchUserById } = require('./lib/repository');
-const { isApprovedDriver } = require('./lib/security');
-io.use(async (socket, next) => {
-  try {
-    const decoded = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
-    const user = await fetchUserById(decoded.id);
-    if (!user) throw new Error('Unknown account');
-    socket.data.user = user;
-    next();
-  } catch { next(new Error('Not authorized')); }
-});
-io.on('connection', socket => {
-  const user = socket.data.user;
-  socket.join(user.id);
-  if (isApprovedDriver(user)) socket.join('drivers');
-  // Ride writes and coordinates use authenticated REST routes only.
-});
-
-const PORT = process.env.PORT || 5000;
-
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  server.listen(process.env.PORT || 5000, () => console.log('KidRide server listening'));
+}

@@ -5,18 +5,12 @@ const REQUIRED_ENV_VARS = [
   'JWT_SECRET'
 ];
 
-const connectDB = async () => {
-  const missingEnvVars = REQUIRED_ENV_VARS.filter((name) => {
-    const value = process.env[name];
-    return !value || !value.trim();
-  });
-
-  if (missingEnvVars.length > 0) {
-    console.error(`Missing required environment variables: ${missingEnvVars.join(', ')}`);
-    process.exit(1);
-  }
-
-  console.log('Supabase configuration loaded');
+// Validate without terminating a serverless worker during module import.
+const connectDB = () => {
+  const missing = REQUIRED_ENV_VARS.filter(name => !process.env[name]?.trim());
+  if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  let url;
+  try { url = new URL(process.env.SUPABASE_URL.trim()); } catch { throw new Error('SUPABASE_URL must be a valid HTTP(S) URL'); }
+  if (!['https:', 'http:'].includes(url.protocol)) throw new Error('SUPABASE_URL must be a valid HTTP(S) URL');
 };
-
 module.exports = connectDB;
