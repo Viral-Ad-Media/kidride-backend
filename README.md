@@ -4,7 +4,7 @@ Express 5 REST API for the KidRide web, Parent mobile, and Driver mobile clients
 
 ## Development
 
-Use Node.js 22 or newer:
+Use Node.js 22 (pinned in `package.json`):
 
 ```sh
 npm ci
@@ -12,7 +12,7 @@ npm start
 npm test
 ```
 
-The local server defaults to port 5000. Configure the environment before starting; Supabase credentials are required at import time.
+The local server defaults to port 5000. Configure the environment before starting; Supabase credentials are required for API routes. Invalid configuration returns HTTP 503 and logs the initialization exception without terminating the worker.
 
 ## Environment
 
@@ -108,3 +108,18 @@ Safety chat uses a server-side Gemini request and is general guidance only. It c
 `npm test` runs regression checks for signup roles, ownership, approval, fare authority, credential redaction, coordinate validation, status/cancellation concurrency, and throttling. Validate the migration in staging, then exercise the complete ride flow, signed uploads, push credentials/receipts, and physical-device GPS before operational use.
 
 Payment processing, driver payouts, automated background checks, automated liveness verification, carpool publishing, and continuous background GPS are not implemented. This code update does not itself deploy database changes or provision third-party credentials.
+
+## Vercel startup and troubleshooting
+
+Use the Express framework preset, repository root directory, and Node.js 22. `server.js` exports the Express handler; only `npm start` on a persistent Node host opens a listener. No custom build command or output directory is needed. Remove legacy project overrides pointing to the nonexistent `index.js`.
+
+Set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, and `JWT_SECRET` in the Vercel **Production** environment, then redeploy: existing deployments do not receive later variable edits. `SUPABASE_URL` must be an HTTP(S) project URL. Do not substitute a browser publishable key for the backend service-role key.
+
+- `GET /health`: process liveness, HTTP 200, without database calls.
+- `GET /` and `GET /api/health`: startup/configuration status, HTTP 200 when initialized and HTTP 503 otherwise. These do **not** prove database connectivity, credentials, migrations, or service availability; `database` is explicitly `not_checked`.
+- `GET /favicon.ico`: HTTP 204; a browser icon request does not invoke a database operation.
+- An unconfigured API returns a generic HTTP 503; details appear under `KidRide API initialization failed` in Vercel Runtime Logs. Missing variables are identified by name only, never by value.
+
+For `FUNCTION_INVOCATION_FAILED`, inspect the actual runtime exception for that deployment/request, not just the request summary. Check missing environment variables, invalid project URL, Node version, and project entry-point overrides. A successful build alone does not establish a working invocation.
+
+This entry point uses authenticated REST polling and foreground location writes on Vercel; Socket.IO is attached only by `npm start` on a persistent Node host. Vercel now supports WebSocket endpoints, but enabling them here would require a server export, WebSocket-only Socket.IO transport, reconnection handling, and shared room state across instances (see https://vercel.com/docs/functions/websockets). Production setup still requires the database migration and credentials documented above.
