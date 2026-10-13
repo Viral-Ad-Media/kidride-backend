@@ -12,6 +12,7 @@ const {
 
 const { isApprovedDriver, ACTIVE_STATUSES, quoteFare, redactOffer, generateTripCode, generateSafeWord, validateCoordinates } = require('../lib/security');
 const { notifyRide } = require('../lib/push');
+const { sendError } = require('../lib/http');
 const router = express.Router();
 
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
@@ -152,7 +153,7 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
 
     return res.status(201).json(payload);
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 
@@ -186,7 +187,7 @@ router.get('/open', protect, async (req, res) => {
 
     return res.json(visibleRides);
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 
@@ -205,7 +206,7 @@ router.get('/active', protect, async (req, res) => {
 
     return res.json(rides[0] ? formatRide(rides[0]) : null);
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 
@@ -236,15 +237,25 @@ router.get('/', protect, async (req, res) => {
     const rides = await fetchRideRows(query);
     return res.json(rides.map(formatRide));
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
+});
+
+router.get('/summary', protect, async (req, res) => {
+  if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
+  try {
+    const { data, error } = await supabaseAdmin.rpc('driver_ride_summary', { p_driver: req.user.id });
+    if (error) throw error;
+    const row = Array.isArray(data) ? data[0] : data;
+    return res.json({ completedCount: Number(row?.completed_count) || 0, totalEarnings: Number(row?.total_earnings) || 0 });
+  } catch (error) { return sendError(res, error, 'Unable to load ride summary'); }
 });
 
 router.post('/quote', protect, (req, res) => {
   if (req.user.role !== 'parent') return res.status(403).json({ message: 'Only parents can obtain quotes' });
   if (!VALID_SERVICE_TYPES.includes(req.body.serviceType)) return res.status(400).json({ message: 'Invalid service type' });
   try { return res.json({ price: quoteFare(req.body.serviceType), currency: 'USD' }); }
-  catch (error) { return res.status(error.status || 500).json({ message: error.message }); }
+  catch (error) { return sendError(res, error); }
 });
 
 router.put('/:id/location', protect, async (req, res) => {
@@ -257,7 +268,7 @@ router.put('/:id/location', protect, async (req, res) => {
     const driver_location = { latitude: req.body.latitude, longitude: req.body.longitude, accuracy: req.body.accuracy ?? null, recordedAt: new Date().toISOString() };
     await updateRideRow(ride.id, { driver_location }, ride.status, req.user.id);
     return res.json(driver_location);
-  } catch (error) { return res.status(error.status || 500).json({ message: error.message }); }
+  } catch (error) { return sendError(res, error); }
 });
 
 router.get('/:id', protect, async (req, res) => {
@@ -271,7 +282,7 @@ router.get('/:id', protect, async (req, res) => {
     }
     return res.json(formatRide(ride));
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 
@@ -340,7 +351,7 @@ router.put('/:id/accept', protect, async (req, res) => {
     await notifyRide(data);
     return res.json(payload);
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 
@@ -380,7 +391,7 @@ router.put('/:id/decline', protect, async (req, res) => {
 
     return res.json({ message: 'Ride declined' });
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 
@@ -423,18 +434,18 @@ router.put('/:id/status', protect, async (req, res) => {
       return res.status(403).json({ message: 'Only drivers can update ride status' });
     }
 
-    const updatedRide = await updateRideRow(req.params.id, { status: ride.status }, expectedStatus, req.user.role === 'driver' ? req.user.id : undefined);
+    const updatedRide = await updateRideRow(req.params.id, { status: ride.status, ...(TERMINAL_STATUSES.has(ride.status) ? { driver_location: null } : {}) }, expectedStatus, req.user.role === 'driver' ? req.user.id : undefined);
     await notifyRide(updatedRide);
     const payload = formatRide(updatedRide);
     const io = req.app.get('io');
 
     if (io) {
-      io.to(updatedRide.parent_id).emit('ride_status_updated', payload);
+      io.to([updatedRide.parent_id, updatedRide.driver_id].filter(Boolean)).emit('ride_status_updated', payload);
     }
 
     return res.json(payload);
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 
@@ -456,18 +467,18 @@ router.put('/:id/cancel', protect, async (req, res) => {
     }
 
     if (ride.status === 'child_picked_up' && !isAdmin) return res.status(409).json({ message: 'A trip with a child onboard cannot be cancelled. Contact support.' });
-    const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled' }, ride.status);
+    const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled', driver_location: null }, ride.status);
     await notifyRide(updatedRide);
     const payload = formatRide(updatedRide);
     const io = req.app.get('io');
 
     if (io) {
-      io.to(updatedRide.parent_id).emit('ride_status_updated', payload);
+      io.to([updatedRide.parent_id, updatedRide.driver_id].filter(Boolean)).emit('ride_status_updated', payload);
     }
 
     return res.json(payload);
   } catch (error) {
-    return res.status(error.status || (error.code === '23505' ? 409 : 500)).json({ message: error.code === '23505' ? 'An active ride already exists for this account' : error.message });
+    return sendError(res, error);
   }
 });
 

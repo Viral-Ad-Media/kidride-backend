@@ -4,6 +4,7 @@ const { protect } = require('../middleware/authMiddleware');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { supabaseAdmin, supabaseAuth } = require('../config/supabase');
 const { fetchUserById, upsertProfileRow } = require('../lib/repository');
+const { sendError } = require('../lib/http');
 
 const router = express.Router();
 
@@ -23,7 +24,8 @@ const VERIFICATION_REQUIRED_RESPONSE = {
 };
 const normalizeEmail = (value = '') => value.trim().toLowerCase();
 
-const generateToken = (id) => jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+// `tv` ties the token to profiles.token_version; bumping it revokes the token.
+const generateToken = (user) => jwt.sign({ id: user.id, tv: user.tokenVersion || 0 }, process.env.JWT_SECRET, { expiresIn: '30d' });
 
 const formatAuthUser = (user, token) => {
   const payload = {
@@ -59,13 +61,28 @@ const createProfilePayload = ({ id, name, email, role }) => ({
   vehicle: {}
 });
 
-const resolveAuthenticatedUser = async (userId, includeToken = false) => {
-  const user = await fetchUserById(userId);
+const resolveAuthenticatedUser = async (userId, includeToken = false, authUser = null) => {
+  let user = await fetchUserById(userId);
+  if (!user && authUser) {
+    // An auth account without a profile (dashboard-created, or a registration
+    // whose profile write failed) gets one rebuilt from its signup metadata.
+    // Role is limited to parent/driver; admins are never created here.
+    const metadata = authUser.user_metadata || {};
+    const role = VALID_ROLES.has(metadata.role) ? metadata.role : 'parent';
+    const email = normalizeEmail(authUser.email || '');
+    await upsertProfileRow(createProfilePayload({
+      id: userId,
+      name: (typeof metadata.name === 'string' && metadata.name.trim()) || email.split('@')[0] || 'KidRide user',
+      email,
+      role
+    }));
+    user = await fetchUserById(userId);
+  }
   if (!user) {
     throw new Error('Unable to load account profile');
   }
 
-  return formatAuthUser(user, includeToken ? generateToken(user.id) : undefined);
+  return formatAuthUser(user, includeToken ? generateToken(user) : undefined);
 };
 
 const isExistingAccountError = (error) => {
@@ -139,7 +156,7 @@ router.post('/register', authLimiter, async (req, res) => {
       await supabaseAdmin.auth.admin.deleteUser(createdUserId);
     }
 
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error, 'Unable to create account right now');
   }
 });
 
@@ -165,10 +182,26 @@ router.post('/login', authLimiter, async (req, res) => {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
 
-    const userPayload = await resolveAuthenticatedUser(data.user.id, true);
+    const userPayload = await resolveAuthenticatedUser(data.user.id, true, data.user);
     return res.json(userPayload);
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error, 'Unable to log in right now');
+  }
+});
+
+// Revokes every token issued to this account (all devices). Clients call it on
+// logout; the conditional update makes concurrent calls harmless.
+router.post('/logout', protect, async (req, res) => {
+  try {
+    const { error } = await supabaseAdmin
+      .from('profiles')
+      .update({ token_version: req.user.tokenVersion + 1 })
+      .eq('id', req.user.id)
+      .eq('token_version', req.user.tokenVersion);
+    if (error) throw error;
+    return res.json({ loggedOut: true });
+  } catch (error) {
+    return sendError(res, error, 'Unable to log out right now');
   }
 });
 
@@ -176,7 +209,7 @@ router.get('/me', protect, async (req, res) => {
   try {
     return res.json(formatAuthUser(req.user));
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error);
   }
 });
 

@@ -21,7 +21,7 @@ The local server defaults to port 5000. Configure the environment before startin
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_ANON_KEY` | Password login client key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Backend-only auth administration, database, and storage access |
-| `JWT_SECRET` | Strong private secret for KidRide JWTs; tokens expire after 30 days |
+| `JWT_SECRET` | Strong private secret for KidRide JWTs; tokens expire after 30 days or on `POST /auth/logout` |
 | `FRONTEND_URLS` | Comma-separated allowed web origins |
 | `NODE_ENV` | Set to `production` to use database-backed rate counters |
 | `TRUST_PROXY_HOPS` | Verified trusted proxy count; defaults to 1 on Vercel, 0 elsewhere |
@@ -29,6 +29,7 @@ The local server defaults to port 5000. Configure the environment before startin
 | `GEMINI_API_KEY` | Backend-only Gemini key for safety chat |
 | `EXPO_ACCESS_TOKEN` | Optional Expo server access token when enhanced push security is enabled |
 | `CRON_SECRET` | Private bearer secret for scheduled receipt processing |
+| `UPLOAD_RATE_LIMIT_WINDOW_MS`, `UPLOAD_RATE_LIMIT_MAX_REQUESTS` | Signed verification-upload URLs per driver account (default 30 per hour) |
 | `EMAIL_REDIRECT_URL` | Optional page the signup confirmation link returns to (must be in Supabase Auth redirect URLs) |
 | `PORT` | Local listener port, default 5000 |
 
@@ -41,7 +42,8 @@ Never put service-role, JWT, Gemini, cron, or Expo server secrets in client bund
 ## Database setup and deployment order
 
 1. For a new project, run `supabase/schema.sql` first.
-2. Apply `supabase/migrations/2026-10-04_security_services.sql` for new and existing projects. It adds private service tables, GPS data, active-ride uniqueness, distributed rate limiting, and the private verification bucket. It removes direct client write permissions.
+2. Apply `supabase/migrations/2026-10-04_security_services.sql` for new and existing projects.
+   Then apply `supabase/migrations/2026-10-14_session_revocation_and_integrity.sql`: it adds `profiles.token_version` (session revocation), the `driver_ride_summary` RPC, clears GPS on finished rides, and makes `rides.child_id` a real foreign key to `children`. That last step aborts if any ride references a missing or malformed child; review and fix those rows before re-running. It adds private service tables, GPS data, active-ride uniqueness, distributed rate limiting, and the private verification bucket. It removes direct client write permissions.
 3. If unique-index creation fails because an account has multiple active rides, the migration aborts. Review those rides with their participants and resolve them deliberately before retrying; the migration never silently cancels live trips.
 4. In Supabase Auth settings, enable **Confirm email** and configure SMTP; registration depends on it to prove email ownership.
 5. Configure environment variables and operator-approved fare values, then deploy this backend.
@@ -59,17 +61,20 @@ All paths below are relative to `/api`. Except registration/login and the schedu
 | --- | --- |
 | `POST /auth/register` | Public; `name`, `email`, `password`, role `parent` or `driver`. Returns 202 `{ requiresEmailVerification: true }` and no token; Supabase emails a confirmation link |
 | `POST /auth/login` | Public password login; 403 `code: email_not_confirmed` until the email is confirmed |
+| `POST /auth/logout` | Revokes every token issued to the account (all devices) |
 | `GET /auth/me` | Current profile |
 | `GET /users/profile`, `PUT /users/profile` | Own profile; editable name, phone, photo URL only |
 | `GET /users/children`, `POST /users/children` | Own child profiles |
 | `POST /users/verification-upload` | Driver; `kind`, `contentType`; returns `path`, `signedUrl` |
 | `POST /users/driver-application` | Driver; phone, complete vehicle details, six uploaded `documents` paths |
+| `GET /users/driver-applications?status=pending\|approved\|rejected` | Admin; applicant list for the review queue |
 | `GET /users/driver-applications/:id` | Admin; five-minute signed document download URLs |
 | `PUT /users/driver-applications/:id/review` | Admin; approve/reject a pending application after actual verification |
 | `POST /users/push-token`, `DELETE /users/push-token` | Register/remove own device token |
 | `POST /rides/quote` | Parent; `serviceType`; returns server fare and USD currency |
 | `POST /rides/request` | Parent; owned `childId`, pickup/dropoff, pickupTime, serviceType, quotedPrice |
 | `GET /rides` | Own rides; admin can list all; scope and capped limit filters |
+| `GET /rides/summary` | Driver; completed-ride count and total earnings over all rides |
 | `GET /rides/open` | Approved verified driver; redacted available offers; admin access allowed |
 | `GET /rides/active` | Latest nonterminal ride belonging to the caller |
 | `GET /rides/:id` | Ride participant or admin |

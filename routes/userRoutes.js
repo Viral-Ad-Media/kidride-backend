@@ -9,6 +9,8 @@ const {
 } = require('../lib/repository');
 
 const { supabaseAdmin } = require('../config/supabase');
+const { sendError } = require('../lib/http');
+const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload } = require('../lib/verification');
 const router = express.Router();
 
@@ -30,7 +32,7 @@ router.get('/profile', protect, async (req, res) => {
   try {
     return res.json(formatUser(req.user));
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error);
   }
 });
 
@@ -53,7 +55,7 @@ router.put('/profile', protect, async (req, res) => {
     const updatedUser = await fetchUserById(req.user.id);
     return res.json(formatUser(updatedUser));
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error);
   }
 });
 
@@ -62,7 +64,7 @@ router.get('/children', protect, async (req, res) => {
     const children = await fetchChildrenRowsByParentId(req.user.id);
     return res.json(children.map(formatChild));
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error);
   }
 });
 
@@ -91,7 +93,7 @@ router.post('/children', protect, async (req, res) => {
       children: children.map(formatChild)
     });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error);
   }
 });
 
@@ -119,12 +121,21 @@ router.post('/driver-application', protect, async (req, res) => {
       user: formatUser(updatedUser)
     });
   } catch (error) {
-    return res.status(500).json({ message: error.message });
+    return sendError(res, error);
   }
 });
 
 
-router.post('/verification-upload', protect, async (req, res) => {
+// Signed upload URLs per account: six documents per application plus retries.
+const uploadLimiter = createRateLimiter({
+  windowMs: parsePositiveInt(process.env.UPLOAD_RATE_LIMIT_WINDOW_MS, 60 * 60 * 1000),
+  max: parsePositiveInt(process.env.UPLOAD_RATE_LIMIT_MAX_REQUESTS, 30),
+  message: 'Too many upload requests. Please try again later.',
+  keyPrefix: 'upload',
+  keyGenerator: (req) => req.user?.id
+});
+
+router.post('/verification-upload', protect, uploadLimiter, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
   if (!REQUIRED_DOCUMENTS.includes(req.body.kind) || !MIME_TYPES.has(req.body.contentType) || (req.body.kind.startsWith('photo_') && req.body.contentType === 'application/pdf')) return res.status(400).json({ message: 'Invalid document type' });
   try {
@@ -143,6 +154,34 @@ router.post('/push-token', protect, async (req, res) => {
 router.delete('/push-token', protect, async (req, res) => {
   const { error } = await supabaseAdmin.from('push_tokens').delete().eq('token', req.body.token).eq('user_id', req.user.id);
   return error ? res.status(503).json({ message: 'Notifications unavailable' }) : res.json({ removed: true });
+});
+
+router.get('/driver-applications', protect, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Admin required' });
+  const status = typeof req.query.status === 'string' ? req.query.status : 'pending';
+  if (!['pending', 'approved', 'rejected'].includes(status)) return res.status(400).json({ message: 'Invalid status filter' });
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('profiles')
+      .select('id, name, email, phone, vehicle, driver_application_status, driver_applications(submitted_at)')
+      .eq('role', 'driver')
+      .eq('driver_application_status', status)
+      .order('updated_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    return res.json((data || []).map((row) => {
+      const application = Array.isArray(row.driver_applications) ? row.driver_applications[0] : row.driver_applications;
+      return {
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        phone: row.phone || null,
+        vehicle: (row.vehicle && typeof row.vehicle === 'object') ? row.vehicle : {},
+        driverApplicationStatus: row.driver_application_status,
+        submittedAt: application?.submitted_at || null
+      };
+    }));
+  } catch (error) { return sendError(res, error, 'Unable to load driver applications'); }
 });
 
 router.get('/driver-applications/:id', protect, async (req, res) => {
