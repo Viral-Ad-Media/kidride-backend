@@ -17,7 +17,7 @@ function response() { return { code: 200, headers: {}, status(n) { this.code=n; 
 function routes(repository = {}, database = {}) {
   const handlers = {};
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
-  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} } });
+  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 } });
   return handlers;
 }
 test('approval requires role, verification and approved status together', () => {
@@ -63,7 +63,7 @@ test('ordinary cancellation is blocked after pickup', async () => {
 });
 test('public signup rejects admin role before creating an auth account', async () => {
   let register;
-  load('routes/authRoutes.js', {express:{Router:()=>({post:(url,...handlers)=>{if(url==='/register')register=handlers.at(-1);},get(){}})},jsonwebtoken:{},'../middleware/authMiddleware':{protect(){}},'../middleware/rateLimitMiddleware':{createRateLimiter:()=>()=>{},parsePositiveInt:(_,fallback)=>fallback},'../config/supabase':{},'../lib/repository':{}});
+  load('routes/authRoutes.js', {express:{Router:()=>({post:(url,...handlers)=>{if(url==='/register')register=handlers.at(-1);},get(){}})},jsonwebtoken:{},'../middleware/authMiddleware':{protect(){},BLOCKED_MESSAGE:'blocked'},'../middleware/rateLimitMiddleware':{createRateLimiter:()=>()=>{},parsePositiveInt:(_,fallback)=>fallback},'../config/supabase':{},'../lib/repository':{}});
   const res=response();await register({body:{name:'Admin',email:'admin@example.test',password:'password',role:'admin'}},res);assert.equal(res.code,400);
 });
 test('assigned driver status writes compare the previous state and surface a stale-update conflict', async () => {
@@ -155,4 +155,49 @@ test('a successful driver application removes only the applicant uploads it does
   assert.deepEqual([...removed], ['u1/license/old-2']);
   const failing = load('lib/verification.js', { '../config/supabase': { supabaseAdmin: { storage: { from: () => ({ list: async () => { throw new Error('down'); } }) } } } });
   await failing.removeUnusedUploads('u1', {});
+});
+test('blocked accounts are refused by protect and are never issued a login token', async () => {
+  const { protect } = load('middleware/authMiddleware.js', { jsonwebtoken:{ verify:()=>({id:'u1',tv:0}) }, '../lib/repository':{ fetchUserById: async()=>({id:'u1',tokenVersion:0,isBlocked:true}) } });
+  let nextCalled=false; const res=response();
+  await protect({headers:{authorization:'Bearer x'}},res,()=>{nextCalled=true;});
+  assert.equal(res.code,403); assert.equal(res.body.code,'account_blocked'); assert.equal(nextCalled,false);
+  const handlers=authHandlers({auth:{signInWithPassword:async()=>({data:{user:{id:'u1',email:'b@example.test',email_confirmed_at:'2026-01-01'}},error:null})}},{fetchUserById:async()=>({id:'u1',name:'B',email:'b@example.test',role:'parent',tokenVersion:0,isBlocked:true})});
+  const login=response(); await handlers['/login']({body:{email:'b@example.test',password:'pw'}},login);
+  assert.equal(login.code,403); assert.equal(login.body.token,undefined);
+});
+function adminRoutes(repository = {}, database = {}) {
+  const handlers = {};
+  const router = Object.fromEntries(['get','put'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args; }]));
+  load('routes/adminUserRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/ratings': { fetchRatingSummaries: async ids => new Map(ids.map(id => [id, { count: 0, average: null }])) } });
+  // Run the admin check and then the handler, as Express would.
+  const run = (key) => async (req, res) => { const [, guard, handler] = handlers[key]; let passed=false; guard(req, res, () => { passed=true; }); if (passed) await handler(req, res); };
+  return { list: run('get /'), block: run('put /:id/block'), revoke: run('put /driver-applications/:id/revoke') };
+}
+test('admin user management is admin-only and block/revoke need a reason', async () => {
+  let updated;
+  const db = { from: () => ({ update: (row) => { updated=row; const q={ eq: () => q, then: (r) => r({ error:null }) }; return q; } }) };
+  const routes = adminRoutes({ fetchUserById: async () => ({ id:'d1', role:'driver', tokenVersion:2, driverApplicationStatus:'approved' }) }, db);
+  let res=response(); await routes.list({ user:{role:'parent'}, query:{role:'driver'} }, res); assert.equal(res.code,403);
+  res=response(); await routes.block({ user:{role:'admin'}, params:{id:'d1'}, body:{} }, res); assert.equal(res.code,400);
+  res=response(); await routes.block({ user:{role:'admin'}, params:{id:'d1'}, body:{reason:'Fake documents'} }, res);
+  assert.equal(res.code,200); assert.equal(updated.is_blocked,true); assert.equal(updated.token_version,3);
+  res=response(); await routes.revoke({ user:{role:'admin'}, params:{id:'d1'}, body:{} }, res); assert.equal(res.code,400);
+  const pending = adminRoutes({ fetchUserById: async () => ({ id:'d2', role:'driver', tokenVersion:0, driverApplicationStatus:'pending' }) }, db);
+  res=response(); await pending.revoke({ user:{role:'admin'}, params:{id:'d2'}, body:{reason:'x'} }, res); assert.equal(res.code,409);
+});
+test('only the booking parent can rate a completed ride, once, with 1-5 stars', async () => {
+  let inserted;
+  const insertResult = { data: { stars: 4, comment: 'Great', created_at: 'now' }, error: null };
+  const db = { from: () => ({ insert: (row) => { inserted=row; return { select: () => ({ single: async () => insertResult }) }; } }) };
+  const ride = { id:'r1', parent_id:'p1', driver_id:'d1', status:'completed' };
+  const handlers = routes({ fetchRideRowById: async () => ride }, db);
+  const rate = handlers['post /:id/rating'];
+  let res=response(); await rate({ user:{id:'p1',role:'parent'}, params:{id:'r1'}, body:{stars:6} }, res); assert.equal(res.code,400);
+  res=response(); await rate({ user:{id:'p2',role:'parent'}, params:{id:'r1'}, body:{stars:4} }, res); assert.equal(res.code,403);
+  res=response(); await rate({ user:{id:'p1',role:'parent'}, params:{id:'r1'}, body:{stars:4, comment:'Great'} }, res);
+  assert.equal(res.code,201); assert.equal(inserted.driver_id,'d1'); assert.equal(inserted.stars,4);
+  insertResult.error = { code:'23505' }; insertResult.data = null;
+  res=response(); await rate({ user:{id:'p1',role:'parent'}, params:{id:'r1'}, body:{stars:5} }, res); assert.equal(res.code,409);
+  const active = routes({ fetchRideRowById: async () => ({ ...ride, status:'driver_assigned' }) }, db)['post /:id/rating'];
+  res=response(); await active({ user:{id:'p1',role:'parent'}, params:{id:'r1'}, body:{stars:5} }, res); assert.equal(res.code,409);
 });

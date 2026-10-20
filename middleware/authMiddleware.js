@@ -1,6 +1,8 @@
 const jwt = require('jsonwebtoken');
 const { fetchUserById } = require('../lib/repository');
 
+const BLOCKED_MESSAGE = 'This account has been blocked. Contact KidRide support if you think this is a mistake.';
+
 const protect = async (req, res, next) => {
   try {
     if (!req.headers.authorization || !req.headers.authorization.startsWith('Bearer')) {
@@ -20,6 +22,10 @@ const protect = async (req, res, next) => {
       return res.status(401).json({ message: 'Session expired. Please log in again.' });
     }
 
+    if (user.isBlocked) {
+      return res.status(403).json({ message: BLOCKED_MESSAGE, code: 'account_blocked' });
+    }
+
     req.user = user;
     return next();
   } catch (error) {
@@ -27,4 +33,4 @@ const protect = async (req, res, next) => {
   }
 };
 
-module.exports = { protect };
+module.exports = { protect, BLOCKED_MESSAGE };

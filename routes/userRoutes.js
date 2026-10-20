@@ -101,11 +101,13 @@ router.post('/children', protect, async (req, res) => {
 router.get('/driver-application', protect, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
   try {
-    const { data, error } = await supabaseAdmin.from('driver_applications').select('submitted_at').eq('driver_id', req.user.id).maybeSingle();
+    const { data, error } = await supabaseAdmin.from('driver_applications').select('submitted_at, reviewed_at, review_note').eq('driver_id', req.user.id).maybeSingle();
     if (error) throw error;
     return res.json({
       status: req.user.driverApplicationStatus || 'none',
-      submittedAt: data?.submitted_at || null
+      submittedAt: data?.submitted_at || null,
+      reviewedAt: data?.reviewed_at || null,
+      reviewNote: req.user.driverApplicationStatus === 'rejected' ? data?.review_note || null : null
     });
   } catch (error) { return sendError(res, error, 'Unable to load your application'); }
 });
@@ -230,6 +232,9 @@ router.put('/driver-applications/:id/review', protect, async (req, res) => {
     });
     if (updateError) throw updateError;
     if (!updated) return res.status(409).json({ message: 'Application changed; refresh first' });
+    // Record when it was decided and, for a rejection, why (shown to the driver).
+    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    await supabaseAdmin.from('driver_applications').update({ reviewed_at: new Date().toISOString(), review_note: req.body.status === 'rejected' && reason ? reason : null }).eq('driver_id', user.id);
     return res.json({ status: req.body.status });
   } catch { return res.status(500).json({ message: 'Unable to review application' }); }
 });

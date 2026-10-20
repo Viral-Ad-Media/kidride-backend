@@ -1,6 +1,6 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const { protect } = require('../middleware/authMiddleware');
+const { protect, BLOCKED_MESSAGE } = require('../middleware/authMiddleware');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { supabaseAdmin, supabaseAuth } = require('../config/supabase');
 const { fetchUserById, upsertProfileRow } = require('../lib/repository');
@@ -80,6 +80,10 @@ const resolveAuthenticatedUser = async (userId, includeToken = false, authUser =
   }
   if (!user) {
     throw new Error('Unable to load account profile');
+  }
+  if (user.isBlocked) {
+    // Never issue a token to a blocked account.
+    throw Object.assign(new Error(BLOCKED_MESSAGE), { status: 403 });
   }
 
   return formatAuthUser(user, includeToken ? generateToken(user) : undefined);
