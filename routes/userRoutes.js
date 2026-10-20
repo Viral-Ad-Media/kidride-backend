@@ -11,7 +11,7 @@ const {
 const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
-const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload } = require('../lib/verification');
+const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload, removeUnusedUploads } = require('../lib/verification');
 const router = express.Router();
 
 const formatUser = (user) => ({
@@ -113,6 +113,7 @@ router.post('/driver-application', protect, async (req, res) => {
       applicant_phone: phone.trim(), applicant_vehicle: incomingVehicle
     });
     if (submissionError) throw submissionError;
+    await removeUnusedUploads(req.user.id, req.body.documents);
 
     const updatedUser = await fetchUserById(req.user.id);
 

@@ -144,3 +144,15 @@ test('login rebuilds a missing profile from auth metadata with a non-admin role'
   const res=response();await handlers['/login']({body:{email:'dash@example.test',password:'pw'}},res);
   assert.equal(res.code,200); assert.equal(written.role,'parent'); assert.equal(res.body.token,'token');
 });
+test('a successful driver application removes only the applicant uploads it does not use', async () => {
+  let removed;
+  const storage = { from: () => ({
+    list: async (folder) => ({ data: folder.endsWith('/license') ? [{ name: 'keep-1' }, { name: 'old-2' }] : [] }),
+    remove: async (paths) => { removed = paths; return {}; }
+  }) };
+  const { removeUnusedUploads } = load('lib/verification.js', { '../config/supabase': { supabaseAdmin: { storage } } });
+  await removeUnusedUploads('u1', { license: 'u1/license/keep-1' });
+  assert.deepEqual([...removed], ['u1/license/old-2']);
+  const failing = load('lib/verification.js', { '../config/supabase': { supabaseAdmin: { storage: { from: () => ({ list: async () => { throw new Error('down'); } }) } } } });
+  await failing.removeUnusedUploads('u1', {});
+});
