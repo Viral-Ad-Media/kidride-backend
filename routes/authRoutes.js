@@ -148,6 +148,12 @@ router.post('/register', authLimiter, async (req, res) => {
         email: normalizedEmail,
         role: normalizedRole
       }));
+
+      // With "Confirm email" switched off in Supabase the account is confirmed at
+      // signup and a session comes back, so sign the user straight in.
+      if (data.session && data.user.email_confirmed_at) {
+        return res.status(201).json(await resolveAuthenticatedUser(data.user.id, true, data.user));
+      }
     }
 
     return res.status(202).json(VERIFICATION_REQUIRED_RESPONSE);

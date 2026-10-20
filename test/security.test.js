@@ -97,6 +97,13 @@ test('registration for an existing email looks identical and writes no profile',
   const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password'}},res);
   assert.equal(res.code,202);assert.equal(wrote,false);
 });
+test('registration signs the user in when Supabase confirms the email at signup', async () => {
+  let profile;
+  const user={id:'u2',email:'pat@example.test',email_confirmed_at:'2026-01-01',identities:[{}],user_metadata:{name:'Pat',role:'parent'}};
+  const handlers=authHandlers({auth:{signUp:async()=>({data:{user,session:{access_token:'s'}},error:null})}},{upsertProfileRow:async row=>{profile=row;},fetchUserById:async()=>profile&&{id:'u2',name:'Pat',email:profile.email,role:profile.role,tokenVersion:0}});
+  const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password',role:'parent'}},res);
+  assert.equal(res.code,201);assert.equal(res.body.token,'token');assert.equal(res.body.role,'parent');assert.equal(res.body.requiresEmailVerification,undefined);
+});
 test('login is refused until the email is confirmed', async () => {
   for (const result of [{data:{user:null},error:{code:'email_not_confirmed'}},{data:{user:{id:'u1',email_confirmed_at:null}},error:null}]) {
     const handlers=authHandlers({auth:{signInWithPassword:async()=>result}});
