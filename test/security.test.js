@@ -304,6 +304,7 @@ function fakeDb(tables) {
       gt: (k, v) => { filters.push((r) => r[k] > v); return q; },
       lte: (k, v) => { filters.push((r) => r[k] <= v); return q; },
       limit: () => q,
+      order: () => q,
       update: (p) => { op = 'update'; payload = p; return q; },
       insert: async (p) => { log.push({ table, op: 'insert', payload: p }); (tables[table] = tables[table] || []).push(p); return { error: null }; },
       upsert: async (p) => { log.push({ table, op: 'upsert', payload: p }); return { error: null }; },
@@ -348,4 +349,32 @@ test('dispatch keeps a live offer, then moves on, and opens the ride after three
   ({ db, log } = fakeDb({ ride_offers: [], driver_locations: [], rides: [{ id: 'r2', dispatch_state: 'targeted' }] }));
   await loadDispatch(db).advanceDispatch({ id: 'r2', status: 'searching_driver', driver_id: null, dispatch_state: 'targeted', pickup_coords: pickup });
   assert.ok(log.some((e) => e.table === 'rides' && e.payload.dispatch_state === 'open'));
+});
+test('admin live map lists online drivers as free or on a ride, with rides in progress', async () => {
+  const recent = new Date().toISOString(), old = '2000-01-01T00:00:00Z';
+  const { db } = fakeDb({
+    driver_locations: [
+      { driver_id: 'd1', lat: 51.5, lng: -0.12, heading: 90, updated_at: recent },
+      { driver_id: 'd2', lat: 51.51, lng: -0.13, heading: null, updated_at: recent },
+      { driver_id: 'd3', lat: 51.52, lng: -0.14, heading: null, updated_at: old }
+    ],
+    profiles: [
+      { id: 'd1', name: 'Ada', role: 'driver', last_online_at: recent, vehicle: { make: 'Kia', plate: 'AB1' } },
+      { id: 'd2', name: 'Ben', role: 'driver', last_online_at: recent, vehicle: {} },
+      { id: 'd3', name: 'Cy', role: 'driver', last_online_at: recent, vehicle: {} }
+    ],
+    rides: [
+      { id: 'r1', status: 'child_picked_up', driver_id: 'd1', pickup_location: 'A', dropoff_location: 'B', pickup_coords: { lat: 51.5, lng: -0.12 }, dispatch_state: 'open' },
+      { id: 'r2', status: 'searching_driver', driver_id: null, pickup_location: 'C', dropoff_location: 'D', dispatch_state: 'targeted' },
+      { id: 'r3', status: 'completed', driver_id: 'd2', pickup_location: 'E', dropoff_location: 'F' }
+    ]
+  });
+  const handlers = {};
+  load('routes/adminLiveRoutes.js', { express: { Router: () => ({ get: (url, ...args) => { handlers[url] = args.at(-1); } }) }, '../middleware/authMiddleware': { protect() {} }, '../config/supabase': { supabaseAdmin: db } });
+  let res = response(); await handlers['/']({ user: { role: 'driver' } }, res); assert.equal(res.code, 403);
+  res = response(); await handlers['/']({ user: { role: 'admin' } }, res);
+  assert.equal(res.code, 200);
+  assert.deepEqual(res.body.drivers.map((d) => `${d.name}:${d.status}`), ['Ada:on_ride', 'Ben:free']);
+  assert.deepEqual({ ...res.body.counts }, { online: 2, onRide: 1, ridesInProgress: 1, searching: 1 });
+  assert.equal(res.body.rides.find((r) => r.id === 'r1').driverName, 'Ada');
 });
