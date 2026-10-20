@@ -280,3 +280,11 @@ test('trusted contacts: parents only, valid phone, at most five, own contacts on
   res = response(); await remove({ user: { id: 'p2', role: 'parent' }, params: { id: 't0' } }, res); assert.equal(res.code, 404);
   res = response(); await remove({ user: { id: 'p1', role: 'parent' }, params: { id: 't0' } }, res); assert.equal(res.code, 200);
 });
+test('driver GPS accepts heading and speed in range; booked places keep only valid lat/lng', () => {
+  assert.equal(security.validateCoordinates({ latitude: 51.5, longitude: -0.12, heading: 270, speed: 12 }), true);
+  assert.equal(security.validateCoordinates({ latitude: 51.5, longitude: -0.12, heading: 400 }), false);
+  assert.equal(security.validateCoordinates({ latitude: 51.5, longitude: -0.12, speed: -1 }), false);
+  assert.deepEqual(security.parsePlaceCoords({ lat: 51.5, lng: -0.12, extra: 'x' }), { lat: 51.5, lng: -0.12 });
+  assert.equal(security.parsePlaceCoords({ lat: 'a', lng: 1 }), null);
+  assert.equal(security.parsePlaceCoords(null), null);
+});

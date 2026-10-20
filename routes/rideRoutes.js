@@ -10,7 +10,7 @@ const {
   updateRideRow
 } = require('../lib/repository');
 
-const { isApprovedDriver, ACTIVE_STATUSES, quoteFare, redactOffer, generateTripCode, generateSafeWord, validateCoordinates } = require('../lib/security');
+const { isApprovedDriver, ACTIVE_STATUSES, quoteFare, redactOffer, generateTripCode, generateSafeWord, validateCoordinates, parsePlaceCoords } = require('../lib/security');
 const { notifyRide } = require('../lib/push');
 const { sendError } = require('../lib/http');
 const { MAX_COMMENT_LENGTH } = require('../lib/ratings');
@@ -85,7 +85,9 @@ const normalizeRideRequestPayload = (body) => {
     dropoffLocation: String(dropoffLocation).trim(),
     pickupTime,
     price,
-    serviceType: body.serviceType || 'pickup_only'
+    serviceType: body.serviceType || 'pickup_only',
+    pickupCoords: parsePlaceCoords(body.pickupCoords),
+    dropoffCoords: parsePlaceCoords(body.dropoffCoords)
   };
 };
 
@@ -135,7 +137,9 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
         price: normalized.price,
         trip_code: generateTripCode(),
         safe_word: generateSafeWord(),
-        service_type: normalized.serviceType
+        service_type: normalized.serviceType,
+        pickup_coords: normalized.pickupCoords,
+        dropoff_coords: normalized.dropoffCoords
       })
       .select('id')
       .single();
@@ -281,7 +285,7 @@ router.put('/:id/location', protect, async (req, res) => {
     const ride = await fetchRideRowById(req.params.id);
     if (!ride || ride.driver_id !== req.user.id) return res.status(403).json({ message: 'Assigned driver required' });
     if (!ACTIVE_STATUSES.includes(ride.status)) return res.status(409).json({ message: 'Ride is not active' });
-    const driver_location = { latitude: req.body.latitude, longitude: req.body.longitude, accuracy: req.body.accuracy ?? null, recordedAt: new Date().toISOString() };
+    const driver_location = { latitude: req.body.latitude, longitude: req.body.longitude, accuracy: req.body.accuracy ?? null, heading: req.body.heading ?? null, speed: req.body.speed ?? null, recordedAt: new Date().toISOString() };
     await updateRideRow(ride.id, { driver_location }, ride.status, req.user.id);
     return res.json(driver_location);
   } catch (error) { return sendError(res, error); }
