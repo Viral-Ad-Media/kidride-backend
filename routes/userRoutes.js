@@ -190,12 +190,15 @@ router.get('/driver-applications/:id', protect, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin.from('driver_applications').select('documents, submitted_at').eq('driver_id', req.params.id).single();
     if (error) throw error;
+    // One batch call instead of one storage round trip per document.
+    const entries = Object.entries(data.documents);
+    const { data: urls, error: signingError } = await supabaseAdmin.storage.from(BUCKET).createSignedUrls(entries.map(([, path]) => path), 300);
+    if (signingError) throw signingError;
     const documents = {};
-    for (const [kind, path] of Object.entries(data.documents)) {
-      const { data: url, error: signingError } = await supabaseAdmin.storage.from(BUCKET).createSignedUrl(path, 300);
-      if (signingError) throw signingError;
-      documents[kind] = url.signedUrl;
-    }
+    entries.forEach(([kind], index) => {
+      if (!urls[index]?.signedUrl) throw new Error('Document link unavailable');
+      documents[kind] = urls[index].signedUrl;
+    });
     return res.json({ documents, submittedAt: data.submitted_at });
   } catch { return res.status(404).json({ message: 'Application unavailable' }); }
 });
