@@ -11,7 +11,7 @@ const {
 const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
-const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload } = require('../lib/verification');
+const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload, removeUnusedUploads } = require('../lib/verification');
 const router = express.Router();
 
 const formatUser = (user) => ({
@@ -97,6 +97,88 @@ router.post('/children', protect, async (req, res) => {
   }
 });
 
+// Parents edit or remove their own children. A child with a ride in progress
+// cannot be removed; a child with past rides is archived so history stays intact.
+const loadOwnChild = async (req, res) => {
+  if (req.user.role !== 'parent') { res.status(403).json({ message: 'Parent account required' }); return null; }
+  const { data, error } = await supabaseAdmin.from('children').select('id, parent_id, archived_at').eq('id', req.params.id).maybeSingle();
+  if (error) throw error;
+  if (!data || data.parent_id !== req.user.id || data.archived_at) { res.status(404).json({ message: 'Child not found' }); return null; }
+  return data;
+};
+
+router.put('/children/:id', protect, async (req, res) => {
+  try {
+    const child = await loadOwnChild(req, res);
+    if (!child) return undefined;
+    const { name, age, notes } = req.body;
+    const normalizedAge = Number(age);
+    if (typeof name !== 'string' || !name.trim() || !Number.isFinite(normalizedAge) || normalizedAge <= 0) {
+      return res.status(400).json({ message: 'Valid child name and age are required' });
+    }
+    const { error } = await supabaseAdmin.from('children').update({
+      name: name.trim(),
+      age: normalizedAge,
+      notes: typeof notes === 'string' && notes.trim() ? notes.trim() : null,
+      updated_at: new Date().toISOString()
+    }).eq('id', child.id).eq('parent_id', req.user.id);
+    if (error) throw error;
+    const children = await fetchChildrenRowsByParentId(req.user.id);
+    return res.json({ children: children.map(formatChild) });
+  } catch (error) {
+    return sendError(res, error, 'Unable to update child');
+  }
+});
+
+router.delete('/children/:id', protect, async (req, res) => {
+  try {
+    const child = await loadOwnChild(req, res);
+    if (!child) return undefined;
+    const { data: activeRides, error: rideError } = await supabaseAdmin.from('rides').select('id')
+      .eq('child_id', child.id).not('status', 'in', '(completed,cancelled)').limit(1);
+    if (rideError) throw rideError;
+    if (activeRides?.length) return res.status(409).json({ message: 'This child has a ride in progress. Finish or cancel it before removing them.' });
+    const { data: pastRides, error: historyError } = await supabaseAdmin.from('rides').select('id').eq('child_id', child.id).limit(1);
+    if (historyError) throw historyError;
+    // Rides reference the child, so one with history is archived rather than deleted.
+    const { error } = pastRides?.length
+      ? await supabaseAdmin.from('children').update({ archived_at: new Date().toISOString() }).eq('id', child.id).eq('parent_id', req.user.id)
+      : await supabaseAdmin.from('children').delete().eq('id', child.id).eq('parent_id', req.user.id);
+    if (error) throw error;
+    const children = await fetchChildrenRowsByParentId(req.user.id);
+    return res.json({ children: children.map(formatChild) });
+  } catch (error) {
+    return sendError(res, error, 'Unable to remove child');
+  }
+});
+
+// Driver presence heartbeat: the app sends { online: true } every 60 s while the
+// driver is Online and { online: false } when they switch Offline.
+router.put('/me/presence', protect, async (req, res) => {
+  if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
+  const online = req.body.online === true;
+  try {
+    const { error } = await supabaseAdmin.from('profiles').update({ last_online_at: online ? new Date().toISOString() : null }).eq('id', req.user.id);
+    if (error) throw error;
+    return res.json({ online });
+  } catch (error) { return sendError(res, error, 'Unable to update availability'); }
+});
+
+// A driver's own application status, so the app can show when it was submitted.
+router.get('/driver-application', protect, async (req, res) => {
+  if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
+  try {
+    const { data, error } = await supabaseAdmin.from('driver_applications').select('submitted_at, reviewed_at, review_note').eq('driver_id', req.user.id).maybeSingle();
+    if (error) throw error;
+    return res.json({
+      status: req.user.driverApplicationStatus || 'none',
+      submittedAt: data?.submitted_at || null,
+      reviewedAt: data?.reviewed_at || null,
+      reviewNote: req.user.driverApplicationStatus === 'rejected' ? data?.review_note || null : null
+    });
+  } catch (error) { return sendError(res, error, 'Unable to load your application'); }
+});
+
 router.post('/driver-application', protect, async (req, res) => {
   try {
     if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
@@ -113,6 +195,7 @@ router.post('/driver-application', protect, async (req, res) => {
       applicant_phone: phone.trim(), applicant_vehicle: incomingVehicle
     });
     if (submissionError) throw submissionError;
+    await removeUnusedUploads(req.user.id, req.body.documents);
 
     const updatedUser = await fetchUserById(req.user.id);
 
@@ -189,12 +272,15 @@ router.get('/driver-applications/:id', protect, async (req, res) => {
   try {
     const { data, error } = await supabaseAdmin.from('driver_applications').select('documents, submitted_at').eq('driver_id', req.params.id).single();
     if (error) throw error;
+    // One batch call instead of one storage round trip per document.
+    const entries = Object.entries(data.documents);
+    const { data: urls, error: signingError } = await supabaseAdmin.storage.from(BUCKET).createSignedUrls(entries.map(([, path]) => path), 300);
+    if (signingError) throw signingError;
     const documents = {};
-    for (const [kind, path] of Object.entries(data.documents)) {
-      const { data: url, error: signingError } = await supabaseAdmin.storage.from(BUCKET).createSignedUrl(path, 300);
-      if (signingError) throw signingError;
-      documents[kind] = url.signedUrl;
-    }
+    entries.forEach(([kind], index) => {
+      if (!urls[index]?.signedUrl) throw new Error('Document link unavailable');
+      documents[kind] = urls[index].signedUrl;
+    });
     return res.json({ documents, submittedAt: data.submitted_at });
   } catch { return res.status(404).json({ message: 'Application unavailable' }); }
 });
@@ -213,6 +299,9 @@ router.put('/driver-applications/:id/review', protect, async (req, res) => {
     });
     if (updateError) throw updateError;
     if (!updated) return res.status(409).json({ message: 'Application changed; refresh first' });
+    // Record when it was decided and, for a rejection, why (shown to the driver).
+    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    await supabaseAdmin.from('driver_applications').update({ reviewed_at: new Date().toISOString(), review_note: req.body.status === 'rejected' && reason ? reason : null }).eq('driver_id', user.id);
     return res.json({ status: req.body.status });
   } catch { return res.status(500).json({ message: 'Unable to review application' }); }
 });

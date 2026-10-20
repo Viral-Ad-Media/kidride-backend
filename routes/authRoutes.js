@@ -1,6 +1,6 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
-const { protect } = require('../middleware/authMiddleware');
+const { protect, BLOCKED_MESSAGE } = require('../middleware/authMiddleware');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { supabaseAdmin, supabaseAuth } = require('../config/supabase');
 const { fetchUserById, upsertProfileRow } = require('../lib/repository');
@@ -81,6 +81,10 @@ const resolveAuthenticatedUser = async (userId, includeToken = false, authUser =
   if (!user) {
     throw new Error('Unable to load account profile');
   }
+  if (user.isBlocked) {
+    // Never issue a token to a blocked account.
+    throw Object.assign(new Error(BLOCKED_MESSAGE), { status: 403 });
+  }
 
   return formatAuthUser(user, includeToken ? generateToken(user) : undefined);
 };
@@ -148,6 +152,12 @@ router.post('/register', authLimiter, async (req, res) => {
         email: normalizedEmail,
         role: normalizedRole
       }));
+
+      // With "Confirm email" switched off in Supabase the account is confirmed at
+      // signup and a session comes back, so sign the user straight in.
+      if (data.session && data.user.email_confirmed_at) {
+        return res.status(201).json(await resolveAuthenticatedUser(data.user.id, true, data.user));
+      }
     }
 
     return res.status(202).json(VERIFICATION_REQUIRED_RESPONSE);
@@ -176,6 +186,13 @@ router.post('/login', authLimiter, async (req, res) => {
 
     if (error?.code === 'email_not_confirmed' || (data?.user && !data.user.email_confirmed_at)) {
       return res.status(403).json({ message: 'Please confirm your email address before logging in.', code: 'email_not_confirmed' });
+    }
+
+    // Supabase answers wrong credentials with a 4xx; anything else (network
+    // failure, 5xx) must not be reported to the user as a wrong password.
+    if (error && !(Number(error.status) >= 400 && Number(error.status) < 500)) {
+      console.error('Login could not reach the auth service', error);
+      return res.status(503).json({ message: 'KidRide is having trouble connecting. Please try again in a moment.' });
     }
 
     if (error || !data.user) {

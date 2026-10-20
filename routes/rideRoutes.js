@@ -13,6 +13,7 @@ const {
 const { isApprovedDriver, ACTIVE_STATUSES, quoteFare, redactOffer, generateTripCode, generateSafeWord, validateCoordinates } = require('../lib/security');
 const { notifyRide } = require('../lib/push');
 const { sendError } = require('../lib/http');
+const { MAX_COMMENT_LENGTH } = require('../lib/ratings');
 const router = express.Router();
 
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
@@ -235,7 +236,15 @@ router.get('/', protect, async (req, res) => {
     }
 
     const rides = await fetchRideRows(query);
-    return res.json(rides.map(formatRide));
+    const formatted = rides.map(formatRide);
+    // Parents see which of their rides they have already rated.
+    if (req.user.role === 'parent' && formatted.length) {
+      const { data: ratings, error: ratingError } = await supabaseAdmin.from('ride_ratings').select('ride_id, stars, comment').in('ride_id', formatted.map((ride) => ride.id));
+      if (ratingError) throw ratingError;
+      const byRide = new Map((ratings || []).map((row) => [row.ride_id, { stars: row.stars, comment: row.comment || null }]));
+      for (const ride of formatted) ride.rating = byRide.get(ride.id) || null;
+    }
+    return res.json(formatted);
   } catch (error) {
     return sendError(res, error);
   }
@@ -249,6 +258,13 @@ router.get('/summary', protect, async (req, res) => {
     const row = Array.isArray(data) ? data[0] : data;
     return res.json({ completedCount: Number(row?.completed_count) || 0, totalEarnings: Number(row?.total_earnings) || 0 });
   } catch (error) { return sendError(res, error, 'Unable to load ride summary'); }
+});
+
+// Every service type with its current fixed price, so parents can compare before booking.
+router.get('/prices', protect, (req, res) => {
+  try {
+    return res.json({ currency: 'USD', prices: Object.fromEntries(VALID_SERVICE_TYPES.map((type) => [type, quoteFare(type)])) });
+  } catch (error) { return sendError(res, error); }
 });
 
 router.post('/quote', protect, (req, res) => {
@@ -479,6 +495,28 @@ router.put('/:id/cancel', protect, async (req, res) => {
     return res.json(payload);
   } catch (error) {
     return sendError(res, error);
+  }
+});
+
+// The parent rates the driver of their completed ride once: 1-5 stars and an optional comment.
+router.post('/:id/rating', protect, async (req, res) => {
+  const stars = Number(req.body.stars);
+  if (!Number.isInteger(stars) || stars < 1 || stars > 5) return res.status(400).json({ message: 'Choose between 1 and 5 stars' });
+  const comment = typeof req.body.comment === 'string' ? req.body.comment.trim() : '';
+  if (comment.length > MAX_COMMENT_LENGTH) return res.status(400).json({ message: `Keep the review under ${MAX_COMMENT_LENGTH} characters` });
+  try {
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride) return res.status(404).json({ message: 'Ride not found' });
+    if (req.user.role !== 'parent' || ride.parent_id !== req.user.id) return res.status(403).json({ message: 'Only the parent who booked this ride can rate it' });
+    if (ride.status !== 'completed' || !ride.driver_id) return res.status(409).json({ message: 'Only completed rides can be rated' });
+    const { data, error } = await supabaseAdmin.from('ride_ratings')
+      .insert({ ride_id: ride.id, parent_id: req.user.id, driver_id: ride.driver_id, stars, comment: comment || null })
+      .select('stars, comment, created_at').single();
+    if (error?.code === '23505') return res.status(409).json({ message: 'You have already rated this ride' });
+    if (error) throw error;
+    return res.status(201).json({ rideId: ride.id, stars: data.stars, comment: data.comment || null, createdAt: data.created_at });
+  } catch (error) {
+    return sendError(res, error, 'Unable to save your rating');
   }
 });
 
