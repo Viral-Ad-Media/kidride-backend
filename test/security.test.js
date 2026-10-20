@@ -258,3 +258,25 @@ test('login reports a connection failure as 503, not as a wrong password', async
     res=response(); await wrong['/login']({body:{email:'a@example.test',password:'pw'}},res); assert.equal(res.code,401);
   } finally { console.error=originalError; }
 });
+test('trusted contacts: parents only, valid phone, at most five, own contacts only', async () => {
+  const handlers = {};
+  const router = Object.fromEntries(['get','post','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args; }]));
+  let rows = [], inserted;
+  const listQuery = { eq: () => listQuery, order: async () => ({ data: rows, error: null }) };
+  const db = { from: () => ({
+    select: () => listQuery,
+    insert: async (row) => { inserted = row; rows = [...rows, { id: `t${rows.length}`, ...row, created_at: 'now' }]; return { error: null }; },
+    delete: () => { const q = { eq: (k, v) => { q[k] = v; return q; }, select: async () => ({ data: q.parent_id === 'p1' ? [{ id: q.id }] : [], error: null }) }; return q; }
+  }) };
+  load('routes/trustedContactRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../config/supabase': { supabaseAdmin: db } });
+  const run = (key) => async (req, res) => { const [, guard, handler] = handlers[key]; let ok=false; guard(req, res, () => { ok=true; }); if (ok) await handler(req, res); };
+  const add = run('post /'), remove = run('delete /:id');
+  let res = response(); await add({ user: { id: 'd1', role: 'driver' }, body: { name: 'A', phone: '+44 7700 900123' } }, res); assert.equal(res.code, 403);
+  res = response(); await add({ user: { id: 'p1', role: 'parent' }, body: { name: 'Gran', phone: 'call me' } }, res); assert.equal(res.code, 400);
+  res = response(); await add({ user: { id: 'p1', role: 'parent' }, body: { name: 'Gran', phone: '+44 7700 900123', relationship: 'Grandmother' } }, res);
+  assert.equal(res.code, 201); assert.equal(inserted.parent_id, 'p1'); assert.equal(res.body.contacts.length, 1);
+  rows = Array.from({ length: 5 }, (_, i) => ({ id: `t${i}`, name: 'X', phone: '0123456789', created_at: 'now' }));
+  res = response(); await add({ user: { id: 'p1', role: 'parent' }, body: { name: 'Sixth', phone: '0123456789' } }, res); assert.equal(res.code, 409);
+  res = response(); await remove({ user: { id: 'p2', role: 'parent' }, params: { id: 't0' } }, res); assert.equal(res.code, 404);
+  res = response(); await remove({ user: { id: 'p1', role: 'parent' }, params: { id: 't0' } }, res); assert.equal(res.code, 200);
+});
