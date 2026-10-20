@@ -188,6 +188,13 @@ router.post('/login', authLimiter, async (req, res) => {
       return res.status(403).json({ message: 'Please confirm your email address before logging in.', code: 'email_not_confirmed' });
     }
 
+    // Supabase answers wrong credentials with a 4xx; anything else (network
+    // failure, 5xx) must not be reported to the user as a wrong password.
+    if (error && !(Number(error.status) >= 400 && Number(error.status) < 500)) {
+      console.error('Login could not reach the auth service', error);
+      return res.status(503).json({ message: 'KidRide is having trouble connecting. Please try again in a moment.' });
+    }
+
     if (error || !data.user) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }

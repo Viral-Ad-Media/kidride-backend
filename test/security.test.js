@@ -223,3 +223,38 @@ test('protect answers 503, not 401, when the account cannot be loaded', async ()
     const res2=response(); await badToken({headers:{authorization:'Bearer x'}},res2,()=>{}); assert.equal(res2.code,401);
   } finally { console.error=originalError; }
 });
+function childRoutes(db) {
+  const handlers = {};
+  const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
+  load('routes/userRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../lib/repository': { fetchChildrenRowsByParentId: async () => [], formatChild: c => c }, '../config/supabase': { supabaseAdmin: db }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, f) => f }, '../lib/verification': { REQUIRED_DOCUMENTS: [], MIME_TYPES: new Set() } });
+  return handlers;
+}
+test('parents can edit and remove only their own children; children with ride history are archived', async () => {
+  let removed = false, archived = false, activeRide = false, history = false;
+  const ridesQuery = () => { let active = false; const q = { eq: () => q, not: () => { active = true; return q; }, limit: async () => ({ data: (active ? activeRide : history) ? [{ id: 'r1' }] : [], error: null }) }; return q; };
+  const done = (fn) => { const q = { eq: () => q, then: (r) => { fn(); r({ error: null }); } }; return q; };
+  const db = { from: (table) => ({
+    select: () => table === 'children' ? { eq: () => ({ maybeSingle: async () => ({ data: { id: 'c1', parent_id: 'p1', archived_at: null }, error: null }) }) } : ridesQuery(),
+    update: (row) => done(() => { if (row.archived_at) archived = true; }),
+    delete: () => done(() => { removed = true; })
+  }) };
+  const h = childRoutes(db);
+  let res = response(); await h['put /children/:id']({ user: { id: 'p2', role: 'parent' }, params: { id: 'c1' }, body: { name: 'A', age: 5 } }, res); assert.equal(res.code, 404);
+  res = response(); await h['put /children/:id']({ user: { id: 'p1', role: 'parent' }, params: { id: 'c1' }, body: { name: '', age: 5 } }, res); assert.equal(res.code, 400);
+  res = response(); await h['put /children/:id']({ user: { id: 'p1', role: 'parent' }, params: { id: 'c1' }, body: { name: 'Ada', age: 7 } }, res); assert.equal(res.code, 200);
+  activeRide = true;
+  res = response(); await h['delete /children/:id']({ user: { id: 'p1', role: 'parent' }, params: { id: 'c1' } }, res); assert.equal(res.code, 409); assert.equal(removed || archived, false);
+  activeRide = false; history = true;
+  res = response(); await h['delete /children/:id']({ user: { id: 'p1', role: 'parent' }, params: { id: 'c1' } }, res); assert.equal(res.code, 200); assert.equal(archived, true); assert.equal(removed, false);
+  history = false;
+  res = response(); await h['delete /children/:id']({ user: { id: 'p1', role: 'parent' }, params: { id: 'c1' } }, res); assert.equal(res.code, 200); assert.equal(removed, true);
+});
+test('login reports a connection failure as 503, not as a wrong password', async () => {
+  const originalError=console.error; console.error=()=>{};
+  try {
+    const offline=authHandlers({auth:{signInWithPassword:async()=>({data:{user:null},error:{name:'AuthRetryableFetchError',status:0,message:'fetch failed'}})}});
+    let res=response(); await offline['/login']({body:{email:'a@example.test',password:'pw'}},res); assert.equal(res.code,503);
+    const wrong=authHandlers({auth:{signInWithPassword:async()=>({data:{user:null},error:{name:'AuthApiError',status:400,code:'invalid_credentials'}})}});
+    res=response(); await wrong['/login']({body:{email:'a@example.test',password:'pw'}},res); assert.equal(res.code,401);
+  } finally { console.error=originalError; }
+});

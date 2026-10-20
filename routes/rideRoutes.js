@@ -260,6 +260,13 @@ router.get('/summary', protect, async (req, res) => {
   } catch (error) { return sendError(res, error, 'Unable to load ride summary'); }
 });
 
+// Every service type with its current fixed price, so parents can compare before booking.
+router.get('/prices', protect, (req, res) => {
+  try {
+    return res.json({ currency: 'USD', prices: Object.fromEntries(VALID_SERVICE_TYPES.map((type) => [type, quoteFare(type)])) });
+  } catch (error) { return sendError(res, error); }
+});
+
 router.post('/quote', protect, (req, res) => {
   if (req.user.role !== 'parent') return res.status(403).json({ message: 'Only parents can obtain quotes' });
   if (!VALID_SERVICE_TYPES.includes(req.body.serviceType)) return res.status(400).json({ message: 'Invalid service type' });

@@ -97,6 +97,61 @@ router.post('/children', protect, async (req, res) => {
   }
 });
 
+// Parents edit or remove their own children. A child with a ride in progress
+// cannot be removed; a child with past rides is archived so history stays intact.
+const loadOwnChild = async (req, res) => {
+  if (req.user.role !== 'parent') { res.status(403).json({ message: 'Parent account required' }); return null; }
+  const { data, error } = await supabaseAdmin.from('children').select('id, parent_id, archived_at').eq('id', req.params.id).maybeSingle();
+  if (error) throw error;
+  if (!data || data.parent_id !== req.user.id || data.archived_at) { res.status(404).json({ message: 'Child not found' }); return null; }
+  return data;
+};
+
+router.put('/children/:id', protect, async (req, res) => {
+  try {
+    const child = await loadOwnChild(req, res);
+    if (!child) return undefined;
+    const { name, age, notes } = req.body;
+    const normalizedAge = Number(age);
+    if (typeof name !== 'string' || !name.trim() || !Number.isFinite(normalizedAge) || normalizedAge <= 0) {
+      return res.status(400).json({ message: 'Valid child name and age are required' });
+    }
+    const { error } = await supabaseAdmin.from('children').update({
+      name: name.trim(),
+      age: normalizedAge,
+      notes: typeof notes === 'string' && notes.trim() ? notes.trim() : null,
+      updated_at: new Date().toISOString()
+    }).eq('id', child.id).eq('parent_id', req.user.id);
+    if (error) throw error;
+    const children = await fetchChildrenRowsByParentId(req.user.id);
+    return res.json({ children: children.map(formatChild) });
+  } catch (error) {
+    return sendError(res, error, 'Unable to update child');
+  }
+});
+
+router.delete('/children/:id', protect, async (req, res) => {
+  try {
+    const child = await loadOwnChild(req, res);
+    if (!child) return undefined;
+    const { data: activeRides, error: rideError } = await supabaseAdmin.from('rides').select('id')
+      .eq('child_id', child.id).not('status', 'in', '(completed,cancelled)').limit(1);
+    if (rideError) throw rideError;
+    if (activeRides?.length) return res.status(409).json({ message: 'This child has a ride in progress. Finish or cancel it before removing them.' });
+    const { data: pastRides, error: historyError } = await supabaseAdmin.from('rides').select('id').eq('child_id', child.id).limit(1);
+    if (historyError) throw historyError;
+    // Rides reference the child, so one with history is archived rather than deleted.
+    const { error } = pastRides?.length
+      ? await supabaseAdmin.from('children').update({ archived_at: new Date().toISOString() }).eq('id', child.id).eq('parent_id', req.user.id)
+      : await supabaseAdmin.from('children').delete().eq('id', child.id).eq('parent_id', req.user.id);
+    if (error) throw error;
+    const children = await fetchChildrenRowsByParentId(req.user.id);
+    return res.json({ children: children.map(formatChild) });
+  } catch (error) {
+    return sendError(res, error, 'Unable to remove child');
+  }
+});
+
 // Driver presence heartbeat: the app sends { online: true } every 60 s while the
 // driver is Online and { online: false } when they switch Offline.
 router.put('/me/presence', protect, async (req, res) => {
