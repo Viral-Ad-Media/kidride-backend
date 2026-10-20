@@ -14,6 +14,10 @@ const { isApprovedDriver, ACTIVE_STATUSES, quoteFare, redactOffer, generateTripC
 const { notifyRide } = require('../lib/push');
 const { sendError } = require('../lib/http');
 const { MAX_COMMENT_LENGTH } = require('../lib/ratings');
+const dispatch = require('../lib/dispatch');
+
+// Dispatch failures must never break booking, offers or tracking.
+const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
 const router = express.Router();
 
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
@@ -139,7 +143,9 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
         safe_word: generateSafeWord(),
         service_type: normalized.serviceType,
         pickup_coords: normalized.pickupCoords,
-        dropoff_coords: normalized.dropoffCoords
+        dropoff_coords: normalized.dropoffCoords,
+        // With a known pickup point the ride goes to the nearest drivers first.
+        dispatch_state: normalized.pickupCoords ? 'targeted' : 'open'
       })
       .select('id')
       .single();
@@ -148,7 +154,11 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       throw error;
     }
 
-    const createdRide = await fetchRideRowById(data.id);
+    let createdRide = await fetchRideRowById(data.id);
+    if (createdRide.dispatch_state === 'targeted') {
+      await safely(() => dispatch.advanceDispatch(createdRide), 'Dispatch failed to start');
+      createdRide = await fetchRideRowById(data.id);
+    }
     const payload = formatRide(createdRide);
     const io = req.app.get('io');
 
@@ -170,6 +180,13 @@ router.get('/open', protect, async (req, res) => {
 
     const requestedLimit = Number(req.query.limit) || 20;
     const limit = Math.max(1, Math.min(requestedLimit, 100));
+    // Move nearest-driver offers along before deciding what this driver sees.
+    await safely(async () => {
+      const { data: targeted, error: targetedError } = await supabaseAdmin.from('rides').select('id, status, driver_id, dispatch_state, pickup_coords')
+        .eq('dispatch_state', 'targeted').in('status', OPEN_REQUEST_STATUSES).is('driver_id', null).limit(20);
+      if (targetedError) throw targetedError;
+      for (const ride of targeted || []) await dispatch.advanceDispatch(ride);
+    }, 'Dispatch advance failed');
     const rides = await fetchRideRows(
       supabaseAdmin
         .from('rides')
@@ -185,10 +202,15 @@ router.get('/open', protect, async (req, res) => {
     }
 
     const declinedRideIds = await fetchDeclinedRideIdsByDriver(req.user.id);
+    const liveOffers = (await safely(() => dispatch.fetchLiveOffers(req.user.id), 'Offer lookup failed')) || new Map();
+    // A targeted ride is only visible to the driver it is currently offered to;
+    // their own offers come first, with the time left to accept.
     const visibleRides = rides
       .filter((ride) => !declinedRideIds.has(ride.id))
+      .filter((ride) => ride.dispatch_state !== 'targeted' || liveOffers.has(ride.id))
+      .sort((a, b) => Number(liveOffers.has(b.id)) - Number(liveOffers.has(a.id)))
       .slice(0, limit)
-      .map(ride => redactOffer(formatRide(ride)));
+      .map((ride) => ({ ...redactOffer(formatRide(ride)), offerExpiresAt: liveOffers.get(ride.id) || null }));
 
     return res.json(visibleRides);
   } catch (error) {
@@ -198,7 +220,7 @@ router.get('/open', protect, async (req, res) => {
 
 router.get('/active', protect, async (req, res) => {
   try {
-    const rides = await fetchRideRows(
+    const activeQuery = () => fetchRideRows(
       supabaseAdmin
         .from('rides')
         .select(RIDE_SELECT)
@@ -208,8 +230,23 @@ router.get('/active', protect, async (req, res) => {
         .order('updated_at', { ascending: false })
         .limit(1)
     );
+    let [ride] = await activeQuery();
+    if (!ride) return res.json(null);
 
-    return res.json(rides[0] ? formatRide(rides[0]) : null);
+    // While a parent waits, keep dispatch moving and say how many drivers are near.
+    let searchInfo;
+    if (req.user.id === ride.parent_id && !ride.driver_id && OPEN_REQUEST_STATUSES.includes(ride.status)) {
+      if (ride.dispatch_state === 'targeted') {
+        await safely(() => dispatch.advanceDispatch(ride), 'Dispatch advance failed');
+        [ride] = await activeQuery();
+      }
+      if (ride && ride.pickup_coords) {
+        const nearby = await safely(() => dispatch.findNearbyDrivers(ride.pickup_coords), 'Nearby lookup failed');
+        searchInfo = { nearbyDrivers: Array.isArray(nearby) ? nearby.length : null };
+      }
+    }
+    if (!ride) return res.json(null);
+    return res.json(searchInfo ? { ...formatRide(ride), dispatch: searchInfo } : formatRide(ride));
   } catch (error) {
     return sendError(res, error);
   }
@@ -330,6 +367,10 @@ router.put('/:id/accept', protect, async (req, res) => {
     if (existingRide.driver_id && existingRide.driver_id !== req.user.id) {
       return res.status(409).json({ message: 'Ride already accepted by another driver' });
     }
+    if (req.user.role !== 'admin' && existingRide.dispatch_state === 'targeted') {
+      const liveOffers = await dispatch.fetchLiveOffers(req.user.id);
+      if (!liveOffers.has(existingRide.id)) return res.status(409).json({ message: 'This ride is being offered to a closer driver right now.' });
+    }
 
     const { data, error } = await supabaseAdmin
       .from('rides')
@@ -363,6 +404,7 @@ router.put('/:id/accept', protect, async (req, res) => {
     }
 
     const payload = formatRide(data);
+    await safely(() => dispatch.setOfferStatus(data.id, req.user.id, 'accepted'), 'Offer update failed');
     const io = req.app.get('io');
     if (io) {
       io.to(data.parent_id).emit('ride_accepted', payload);
@@ -408,6 +450,12 @@ router.put('/:id/decline', protect, async (req, res) => {
     if (error) {
       throw error;
     }
+
+    // Pass a targeted ride straight to the next nearest driver.
+    await safely(async () => {
+      await dispatch.setOfferStatus(ride.id, req.user.id, 'declined');
+      await dispatch.advanceDispatch(ride);
+    }, 'Dispatch advance after decline failed');
 
     return res.json({ message: 'Ride declined' });
   } catch (error) {

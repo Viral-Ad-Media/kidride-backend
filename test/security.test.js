@@ -17,7 +17,7 @@ function response() { return { code: 200, headers: {}, status(n) { this.code=n; 
 function routes(repository = {}, database = {}) {
   const handlers = {};
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
-  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 } });
+  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/dispatch': { advanceDispatch: async () => {}, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] } });
   return handlers;
 }
 test('approval requires role, verification and approved status together', () => {
@@ -206,7 +206,7 @@ test('driver presence heartbeat sets or clears last_online_at, drivers only', as
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
   let updated;
   const supabaseAdmin = { from: () => ({ update: (row) => { updated=row; return { eq: async () => ({ error:null }) }; } }) };
-  load('routes/userRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../lib/repository': {}, '../config/supabase': { supabaseAdmin }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, f) => f }, '../lib/verification': { REQUIRED_DOCUMENTS: [], MIME_TYPES: new Set() } });
+  load('routes/userRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../lib/repository': {}, '../config/supabase': { supabaseAdmin }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, f) => f }, '../lib/verification': { REQUIRED_DOCUMENTS: [], MIME_TYPES: new Set() }, '../lib/dispatch': { saveDriverLocation: async () => {} } });
   const presence = handlers['put /me/presence'];
   let res=response(); await presence({ user:{id:'p1',role:'parent'}, body:{online:true} }, res); assert.equal(res.code,403);
   res=response(); await presence({ user:{id:'d1',role:'driver'}, body:{online:true} }, res); assert.equal(res.body.online,true); assert.ok(updated.last_online_at);
@@ -226,7 +226,7 @@ test('protect answers 503, not 401, when the account cannot be loaded', async ()
 function childRoutes(db) {
   const handlers = {};
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
-  load('routes/userRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../lib/repository': { fetchChildrenRowsByParentId: async () => [], formatChild: c => c }, '../config/supabase': { supabaseAdmin: db }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, f) => f }, '../lib/verification': { REQUIRED_DOCUMENTS: [], MIME_TYPES: new Set() } });
+  load('routes/userRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../lib/repository': { fetchChildrenRowsByParentId: async () => [], formatChild: c => c }, '../config/supabase': { supabaseAdmin: db }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, f) => f }, '../lib/verification': { REQUIRED_DOCUMENTS: [], MIME_TYPES: new Set() }, '../lib/dispatch': { saveDriverLocation: async () => {} } });
   return handlers;
 }
 test('parents can edit and remove only their own children; children with ride history are archived', async () => {
@@ -287,4 +287,65 @@ test('driver GPS accepts heading and speed in range; booked places keep only val
   assert.deepEqual(security.parsePlaceCoords({ lat: 51.5, lng: -0.12, extra: 'x' }), { lat: 51.5, lng: -0.12 });
   assert.equal(security.parsePlaceCoords({ lat: 'a', lng: 1 }), null);
   assert.equal(security.parsePlaceCoords(null), null);
+});
+// A tiny in-memory stand-in for the Supabase query builder, enough for lib/dispatch.js.
+function fakeDb(tables) {
+  const log = [];
+  const from = (table) => {
+    let filters = [];
+    let op = 'select', payload;
+    const rows = () => (tables[table] || []).filter((row) => filters.every((f) => f(row)));
+    const q = {
+      select: () => q,
+      eq: (k, v) => { filters.push((r) => r[k] === v); return q; },
+      in: (k, vs) => { filters.push((r) => vs.includes(r[k])); return q; },
+      is: (k, v) => { filters.push((r) => (r[k] ?? null) === v); return q; },
+      gte: (k, v) => { filters.push((r) => r[k] >= v); return q; },
+      gt: (k, v) => { filters.push((r) => r[k] > v); return q; },
+      lte: (k, v) => { filters.push((r) => r[k] <= v); return q; },
+      limit: () => q,
+      update: (p) => { op = 'update'; payload = p; return q; },
+      insert: async (p) => { log.push({ table, op: 'insert', payload: p }); (tables[table] = tables[table] || []).push(p); return { error: null }; },
+      upsert: async (p) => { log.push({ table, op: 'upsert', payload: p }); return { error: null }; },
+      then: (resolve) => {
+        if (op === 'update') { const hit = rows(); hit.forEach((r) => Object.assign(r, payload)); log.push({ table, op: 'update', payload, count: hit.length }); return resolve({ error: null }); }
+        return resolve({ data: rows(), error: null });
+      }
+    };
+    return q;
+  };
+  return { db: { from }, log };
+}
+const loadDispatch = (db) => load('lib/dispatch.js', { '../config/supabase': { supabaseAdmin: db }, 'h3-js': require('h3-js') });
+const now = () => new Date().toISOString();
+const pickup = { lat: 51.5034, lng: -0.1276 };
+const nearDriver = (id, lat, lng) => ({ driver_id: id, lat, lng, h3_index: require('h3-js').latLngToCell(lat, lng, 8), updated_at: now() });
+const approved = (id, extra = {}) => ({ id, role: 'driver', is_verified_driver: true, driver_application_status: 'approved', is_blocked: false, last_online_at: now(), ...extra });
+
+test('dispatch offers the ride to the nearest eligible driver first', async () => {
+  const { db, log } = fakeDb({
+    driver_locations: [nearDriver('far', 51.5070, -0.1300), nearDriver('near', 51.5036, -0.1278), nearDriver('busy', 51.5035, -0.1277), nearDriver('offline', 51.5034, -0.1276)],
+    profiles: [approved('far'), approved('near'), approved('busy'), approved('offline', { last_online_at: '2000-01-01T00:00:00Z' })],
+    rides: [{ driver_id: 'busy', status: 'driver_assigned' }],
+    ride_offers: []
+  });
+  const dispatch = loadDispatch(db);
+  const nearby = await dispatch.findNearbyDrivers(pickup);
+  assert.deepEqual(nearby.map((d) => d.driverId), ['near', 'far']);
+  await dispatch.advanceDispatch({ id: 'r1', status: 'searching_driver', driver_id: null, dispatch_state: 'targeted', pickup_coords: pickup });
+  const offer = log.find((e) => e.table === 'ride_offers' && e.op === 'insert');
+  assert.equal(offer.payload.driver_id, 'near');
+  assert.ok(new Date(offer.payload.expires_at) > new Date());
+});
+test('dispatch keeps a live offer, then moves on, and opens the ride after three drivers or when nobody is near', async () => {
+  const future = new Date(Date.now() + 10000).toISOString(), past = new Date(Date.now() - 1000).toISOString();
+  let { db, log } = fakeDb({ ride_offers: [{ ride_id: 'r1', driver_id: 'a', status: 'pending', expires_at: future }] });
+  await loadDispatch(db).advanceDispatch({ id: 'r1', status: 'searching_driver', driver_id: null, dispatch_state: 'targeted', pickup_coords: pickup });
+  assert.equal(log.length, 0);
+  ({ db, log } = fakeDb({ ride_offers: ['a', 'b', 'c'].map((d) => ({ ride_id: 'r1', driver_id: d, status: 'declined', expires_at: past })), rides: [{ id: 'r1', dispatch_state: 'targeted' }] }));
+  await loadDispatch(db).advanceDispatch({ id: 'r1', status: 'searching_driver', driver_id: null, dispatch_state: 'targeted', pickup_coords: pickup });
+  assert.ok(log.some((e) => e.table === 'rides' && e.payload.dispatch_state === 'open'));
+  ({ db, log } = fakeDb({ ride_offers: [], driver_locations: [], rides: [{ id: 'r2', dispatch_state: 'targeted' }] }));
+  await loadDispatch(db).advanceDispatch({ id: 'r2', status: 'searching_driver', driver_id: null, dispatch_state: 'targeted', pickup_coords: pickup });
+  assert.ok(log.some((e) => e.table === 'rides' && e.payload.dispatch_state === 'open'));
 });

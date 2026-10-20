@@ -12,6 +12,8 @@ const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload, removeUnusedUploads } = require('../lib/verification');
+const { validateCoordinates } = require('../lib/security');
+const { saveDriverLocation } = require('../lib/dispatch');
 const router = express.Router();
 
 const formatUser = (user) => ({
@@ -152,14 +154,20 @@ router.delete('/children/:id', protect, async (req, res) => {
   }
 });
 
-// Driver presence heartbeat: the app sends { online: true } every 60 s while the
-// driver is Online and { online: false } when they switch Offline.
+// Driver presence heartbeat: while Online the app sends { online: true } with
+// the driver's position (when the browser shares it) so nearby rides can be
+// offered to them; { online: false } when they switch Offline.
 router.put('/me/presence', protect, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
   const online = req.body.online === true;
   try {
     const { error } = await supabaseAdmin.from('profiles').update({ last_online_at: online ? new Date().toISOString() : null }).eq('id', req.user.id);
     if (error) throw error;
+    const position = { latitude: req.body.latitude, longitude: req.body.longitude, heading: req.body.heading };
+    if (online && typeof position.latitude === 'number') {
+      if (!validateCoordinates(position)) return res.status(400).json({ message: 'Invalid coordinates' });
+      await saveDriverLocation(req.user.id, position);
+    }
     return res.json({ online });
   } catch (error) { return sendError(res, error, 'Unable to update availability'); }
 });
