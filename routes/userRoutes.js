@@ -97,6 +97,19 @@ router.post('/children', protect, async (req, res) => {
   }
 });
 
+// A driver's own application status, so the app can show when it was submitted.
+router.get('/driver-application', protect, async (req, res) => {
+  if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
+  try {
+    const { data, error } = await supabaseAdmin.from('driver_applications').select('submitted_at').eq('driver_id', req.user.id).maybeSingle();
+    if (error) throw error;
+    return res.json({
+      status: req.user.driverApplicationStatus || 'none',
+      submittedAt: data?.submitted_at || null
+    });
+  } catch (error) { return sendError(res, error, 'Unable to load your application'); }
+});
+
 router.post('/driver-application', protect, async (req, res) => {
   try {
     if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
