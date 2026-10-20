@@ -201,3 +201,25 @@ test('only the booking parent can rate a completed ride, once, with 1-5 stars', 
   const active = routes({ fetchRideRowById: async () => ({ ...ride, status:'driver_assigned' }) }, db)['post /:id/rating'];
   res=response(); await active({ user:{id:'p1',role:'parent'}, params:{id:'r1'}, body:{stars:5} }, res); assert.equal(res.code,409);
 });
+test('driver presence heartbeat sets or clears last_online_at, drivers only', async () => {
+  const handlers = {};
+  const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
+  let updated;
+  const supabaseAdmin = { from: () => ({ update: (row) => { updated=row; return { eq: async () => ({ error:null }) }; } }) };
+  load('routes/userRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../lib/repository': {}, '../config/supabase': { supabaseAdmin }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, f) => f }, '../lib/verification': { REQUIRED_DOCUMENTS: [], MIME_TYPES: new Set() } });
+  const presence = handlers['put /me/presence'];
+  let res=response(); await presence({ user:{id:'p1',role:'parent'}, body:{online:true} }, res); assert.equal(res.code,403);
+  res=response(); await presence({ user:{id:'d1',role:'driver'}, body:{online:true} }, res); assert.equal(res.body.online,true); assert.ok(updated.last_online_at);
+  res=response(); await presence({ user:{id:'d1',role:'driver'}, body:{online:false} }, res); assert.equal(updated.last_online_at,null);
+});
+test('protect answers 503, not 401, when the account cannot be loaded', async () => {
+  const originalError=console.error; console.error=()=>{};
+  try {
+    const { protect } = load('middleware/authMiddleware.js', { jsonwebtoken:{ verify:()=>({id:'u1',tv:0}) }, '../lib/repository':{ fetchUserById: async()=>{ throw new Error('fetch failed'); } } });
+    let nextCalled=false; const res=response();
+    await protect({headers:{authorization:'Bearer x'}},res,()=>{nextCalled=true;});
+    assert.equal(res.code,503); assert.equal(nextCalled,false);
+    const { protect: badToken } = load('middleware/authMiddleware.js', { jsonwebtoken:{ verify:()=>{ throw new Error('bad'); } }, '../lib/repository':{ fetchUserById: async()=>null } });
+    const res2=response(); await badToken({headers:{authorization:'Bearer x'}},res2,()=>{}); assert.equal(res2.code,401);
+  } finally { console.error=originalError; }
+});

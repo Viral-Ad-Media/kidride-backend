@@ -11,6 +11,8 @@ const router = express.Router();
 
 const MAX_PAGE_SIZE = 100;
 const MAX_REASON_LENGTH = 500;
+// A driver is online while their heartbeat (every 60 s) is at most this old.
+const ONLINE_WINDOW_MS = 2 * 60 * 1000;
 
 const requireAdmin = (req, res, next) => (req.user.role === 'admin' ? next() : res.status(403).json({ message: 'Admin required' }));
 
@@ -33,7 +35,7 @@ router.get('/', protect, requireAdmin, async (req, res) => {
   try {
     let query = supabaseAdmin
       .from('profiles')
-      .select('id, name, email, phone, vehicle, is_verified_driver, driver_application_status, is_blocked, blocked_reason, blocked_at, created_at', { count: 'exact' })
+      .select('id, name, email, phone, vehicle, is_verified_driver, driver_application_status, is_blocked, blocked_reason, blocked_at, created_at, last_online_at', { count: 'exact' })
       .eq('role', role)
       .order('created_at', { ascending: false })
       .range((page - 1) * pageSize, page * pageSize - 1);
@@ -43,6 +45,13 @@ router.get('/', protect, requireAdmin, async (req, res) => {
     const ids = (profiles || []).map((profile) => profile.id);
 
     let extras = () => ({});
+    let onlineCount;
+    const onlineSince = new Date(Date.now() - ONLINE_WINDOW_MS).toISOString();
+    if (role === 'driver') {
+      const { count: online, error: onlineError } = await supabaseAdmin.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'driver').gte('last_online_at', onlineSince);
+      if (onlineError) throw onlineError;
+      onlineCount = online || 0;
+    }
     if (ids.length && role === 'driver') {
       const [rides, applications, ratings] = await Promise.all([
         supabaseAdmin.from('rides').select('driver_id').in('driver_id', ids).eq('status', 'completed'),
@@ -63,6 +72,8 @@ router.get('/', protect, requireAdmin, async (req, res) => {
           reviewedAt: application?.reviewed_at || null,
           reviewNote: application?.review_note || null,
           completedRides: completed.get(profile.id) || 0,
+          isOnline: !!profile.last_online_at && profile.last_online_at >= onlineSince,
+          lastOnlineAt: profile.last_online_at || null,
           rating: ratings.get(profile.id)
         };
       };
@@ -82,6 +93,7 @@ router.get('/', protect, requireAdmin, async (req, res) => {
       page,
       pageSize,
       total: count || 0,
+      ...(onlineCount === undefined ? {} : { onlineCount }),
       users: (profiles || []).map((profile) => ({
         id: profile.id,
         name: profile.name,

@@ -97,6 +97,18 @@ router.post('/children', protect, async (req, res) => {
   }
 });
 
+// Driver presence heartbeat: the app sends { online: true } every 60 s while the
+// driver is Online and { online: false } when they switch Offline.
+router.put('/me/presence', protect, async (req, res) => {
+  if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
+  const online = req.body.online === true;
+  try {
+    const { error } = await supabaseAdmin.from('profiles').update({ last_online_at: online ? new Date().toISOString() : null }).eq('id', req.user.id);
+    if (error) throw error;
+    return res.json({ online });
+  } catch (error) { return sendError(res, error, 'Unable to update availability'); }
+});
+
 // A driver's own application status, so the app can show when it was submitted.
 router.get('/driver-application', protect, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
