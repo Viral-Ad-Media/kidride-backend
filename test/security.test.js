@@ -305,6 +305,7 @@ function fakeDb(tables) {
       lte: (k, v) => { filters.push((r) => r[k] <= v); return q; },
       limit: () => q,
       order: () => q,
+      maybeSingle: async () => ({ data: rows()[0] || null, error: null }),
       update: (p) => { op = 'update'; payload = p; return q; },
       insert: async (p) => { log.push({ table, op: 'insert', payload: p }); (tables[table] = tables[table] || []).push(p); return { error: null }; },
       upsert: async (p) => { log.push({ table, op: 'upsert', payload: p }); return { error: null }; },
@@ -377,4 +378,45 @@ test('admin live map lists online drivers as free or on a ride, with rides in pr
   assert.deepEqual(res.body.drivers.map((d) => `${d.name}:${d.status}`), ['Ada:on_ride', 'Ben:free']);
   assert.deepEqual({ ...res.body.counts }, { online: 2, onRide: 1, ridesInProgress: 1, searching: 1 });
   assert.equal(res.body.rides.find((r) => r.id === 'r1').driverName, 'Ada');
+});
+test('nearby rides: waiting rides within 5 km of the driver, nearest first, never ones offered to someone else', async () => {
+  const future = new Date(Date.now() + 10000).toISOString();
+  const waiting = (id, lat, lng, extra = {}) => ({ id, status: 'searching_driver', driver_id: null, dispatch_state: 'open', pickup_location: id, pickup_coords: { lat, lng }, ...extra });
+  const { db } = fakeDb({
+    rides: [
+      waiting('far', 51.5034, -0.0400), // about 6 km east
+      waiting('near', 51.5040, -0.1280),
+      waiting('mid', 51.5100, -0.1400),
+      waiting('otherOffer', 51.5035, -0.1277, { dispatch_state: 'targeted' }),
+      waiting('myOffer', 51.5200, -0.1276, { dispatch_state: 'targeted' }),
+      waiting('noCoords', 0, 0, { pickup_coords: null }),
+      { ...waiting('taken', 51.5034, -0.1276), status: 'driver_assigned', driver_id: 'x' }
+    ],
+    ride_declines: [{ driver_id: 'd1', ride_id: 'mid' }],
+    ride_offers: [{ ride_id: 'otherOffer', driver_id: 'd2', status: 'pending', expires_at: future }, { ride_id: 'myOffer', driver_id: 'd1', status: 'pending', expires_at: future }],
+    driver_locations: [{ driver_id: 'd1', lat: 51.5034, lng: -0.1276 }]
+  });
+  const handlers = {};
+  load('routes/driverRoutes.js', {
+    express: { Router: () => ({ get: (url, ...args) => { handlers[url] = args.at(-1); } }) },
+    '../middleware/authMiddleware': { protect() {} },
+    '../config/supabase': { supabaseAdmin: db },
+    '../lib/ratings': { fetchRatingSummaries: async () => new Map() },
+    '../lib/repository': { RIDE_SELECT: '*', fetchRideRows: async (query) => (await query).data, formatRide: (row) => ({ id: row.id, pickupLocation: row.pickup_location, tripCode: '1234', safeWord: 'secret' }) },
+    '../lib/security': security,
+    '../lib/dispatch': loadDispatch(db)
+  });
+  const driver = { id: 'd1', role: 'driver', isVerifiedDriver: true, driverApplicationStatus: 'approved' };
+  let res = response(); await handlers['/nearby-rides']({ user: { ...driver, driverApplicationStatus: 'pending' }, query: {} }, res); assert.equal(res.code, 403);
+  res = response(); await handlers['/nearby-rides']({ user: driver, query: { lat: '91', lng: '0' } }, res); assert.equal(res.code, 400);
+  res = response(); await handlers['/nearby-rides']({ user: driver, query: { lat: '51.5034', lng: '-0.1276' } }, res);
+  assert.equal(res.code, 200);
+  assert.deepEqual(res.body.rides.map((r) => r.id), ['near', 'mid', 'myOffer']);
+  assert.equal(res.body.rides[1].declined, true);
+  assert.equal(res.body.rides[2].offerExpiresAt, future);
+  assert.ok(res.body.rides.every((r) => r.tripCode === undefined && r.safeWord === undefined && r.distanceMeters <= 5000));
+  // Without coordinates in the request it uses the driver's last reported position.
+  res = response(); await handlers['/nearby-rides']({ user: driver, query: {} }, res);
+  assert.deepEqual({ ...res.body.origin }, { lat: 51.5034, lng: -0.1276 });
+  assert.equal(res.body.rides.length, 3);
 });
