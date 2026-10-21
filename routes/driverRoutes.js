@@ -6,6 +6,7 @@ const { fetchRatingSummaries } = require('../lib/ratings');
 const { RIDE_SELECT, fetchRideRows, formatRide } = require('../lib/repository');
 const { isApprovedDriver, redactOffer, validateCoordinates } = require('../lib/security');
 const dispatch = require('../lib/dispatch');
+const scheduling = require('../lib/scheduling');
 
 const router = express.Router();
 
@@ -13,8 +14,9 @@ const NEARBY_RADIUS_METERS = 5000;
 const NEARBY_LIMIT = 20;
 
 // Waiting rides around an idle driver, nearest first, for the map on their
-// dashboard. Rides being offered to another driver are left out (they could
-// not accept them); rides this driver declined are included and flagged.
+// dashboard. Rides being offered to another driver, and rides booked for
+// later that are not open to drivers yet, are left out (they could not accept
+// them); rides this driver declined are included and flagged.
 router.get('/nearby-rides', protect, async (req, res) => {
   try {
     if (!isApprovedDriver(req.user)) return res.status(403).json({ message: 'Only approved drivers can see nearby rides' });
@@ -45,7 +47,7 @@ router.get('/nearby-rides', protect, async (req, res) => {
     const declined = new Set((declines.data || []).map((row) => row.ride_id));
 
     const nearby = rides
-      .filter((ride) => ride.pickup_coords && (ride.dispatch_state !== 'targeted' || liveOffers.has(ride.id)))
+      .filter((ride) => ride.pickup_coords && !scheduling.isHeld(ride) && (ride.dispatch_state !== 'targeted' || liveOffers.has(ride.id)))
       .map((ride) => ({ ride, distance: dispatch.distanceMeters(origin, ride.pickup_coords) }))
       .filter(({ distance }) => distance <= NEARBY_RADIUS_METERS)
       .sort((a, b) => a.distance - b.distance)
