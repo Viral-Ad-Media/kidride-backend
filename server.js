@@ -33,6 +33,7 @@ try {
   router.use('/users', require('./routes/adminUserRoutes'));
   router.use('/users', require('./routes/userRoutes'));
   router.use('/drivers', require('./routes/driverRoutes'));
+  router.use('/admin/live-map', require('./routes/adminLiveRoutes'));
   router.use('/rides', require('./routes/rideRoutes'));
   router.use('/safety-chat', require('./routes/safetyRoutes'));
   router.use('/notification-receipts', require('./routes/receiptRoutes'));
