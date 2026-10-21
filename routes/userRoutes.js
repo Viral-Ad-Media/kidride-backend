@@ -27,7 +27,8 @@ const formatUser = (user) => ({
   children: user.children || [],
   isVerifiedDriver: !!user.isVerifiedDriver,
   driverApplicationStatus: user.driverApplicationStatus || 'none',
-  vehicle: user.vehicle || {}
+  vehicle: user.vehicle || {},
+  notifyEmail: user.notifyEmail !== false
 });
 
 router.get('/profile', protect, async (req, res) => {
@@ -41,7 +42,7 @@ router.get('/profile', protect, async (req, res) => {
 router.put('/profile', protect, async (req, res) => {
   try {
     const updates = {};
-    const { name, phone, photoUrl } = req.body;
+    const { name, phone, photoUrl, notifyEmail } = req.body;
 
     if (typeof name === 'string') {
       updates.name = name.trim();
@@ -51,6 +52,9 @@ router.put('/profile', protect, async (req, res) => {
     }
     if (typeof photoUrl === 'string') {
       updates.photo_url = photoUrl.trim();
+    }
+    if (typeof notifyEmail === 'boolean') {
+      updates.notify_email = notifyEmail;
     }
 
     await updateProfileRowById(req.user.id, updates);

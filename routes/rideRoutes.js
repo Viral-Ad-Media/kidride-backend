@@ -11,7 +11,7 @@ const {
 } = require('../lib/repository');
 
 const { isApprovedDriver, ACTIVE_STATUSES, quoteFare, redactOffer, generateTripCode, generateSafeWord, validateCoordinates, parsePlaceCoords } = require('../lib/security');
-const { notifyRide } = require('../lib/push');
+const { notifyRideEvent } = require('../lib/notifications');
 const { sendError } = require('../lib/http');
 const { MAX_COMMENT_LENGTH } = require('../lib/ratings');
 const dispatch = require('../lib/dispatch');
@@ -181,6 +181,7 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       await safely(() => dispatch.advanceDispatch(createdRide), 'Dispatch failed to start');
       createdRide = await fetchRideRowById(data.id);
     }
+    await notifyRideEvent(createdRide, 'booked');
     const payload = formatRide(createdRide);
     const io = req.app.get('io');
 
@@ -497,7 +498,7 @@ router.put('/:id/accept', protect, async (req, res) => {
       io.to(data.parent_id).emit('ride_accepted', payload);
     }
 
-    await notifyRide(data);
+    await notifyRideEvent(data);
     return res.json(payload);
   } catch (error) {
     return sendError(res, error);
@@ -597,7 +598,7 @@ router.put('/:id/status', protect, async (req, res) => {
       if (updateError?.code === '23505') return res.status(409).json({ message: 'Finish your current trip before starting this one.' });
       throw updateError;
     }
-    await notifyRide(updatedRide);
+    await notifyRideEvent(updatedRide);
     const payload = formatRide(updatedRide);
     const io = req.app.get('io');
 
@@ -630,7 +631,7 @@ router.put('/:id/cancel', protect, async (req, res) => {
 
     if (ride.status === 'child_picked_up' && !isAdmin) return res.status(409).json({ message: 'A trip with a child onboard cannot be cancelled. Contact support.' });
     const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled', driver_location: null }, ride.status);
-    await notifyRide(updatedRide);
+    await notifyRideEvent(updatedRide);
     const payload = formatRide(updatedRide);
     const io = req.app.get('io');
 
