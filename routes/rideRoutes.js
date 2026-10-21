@@ -15,6 +15,8 @@ const { notifyRide } = require('../lib/push');
 const { sendError } = require('../lib/http');
 const { MAX_COMMENT_LENGTH } = require('../lib/ratings');
 const dispatch = require('../lib/dispatch');
+const scheduling = require('../lib/scheduling');
+const { timingSafeEqual } = require('node:crypto');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
@@ -79,6 +81,11 @@ const normalizeRideRequestPayload = (body) => {
   if (pickupTime && Number.isNaN(pickupTime.getTime())) {
     return { error: 'pickupTime must be a valid date' };
   }
+  const scheduled = body.scheduled === true;
+  if (scheduled) {
+    const timeError = scheduling.validateScheduledTime(pickupTime);
+    if (timeError) return { error: timeError };
+  }
   if (body.serviceType && !VALID_SERVICE_TYPES.includes(body.serviceType)) {
     return { error: `serviceType must be one of: ${VALID_SERVICE_TYPES.join(', ')}` };
   }
@@ -88,6 +95,7 @@ const normalizeRideRequestPayload = (body) => {
     pickupLocation: String(pickupLocation).trim(),
     dropoffLocation: String(dropoffLocation).trim(),
     pickupTime,
+    scheduled,
     price,
     serviceType: body.serviceType || 'pickup_only',
     pickupCoords: parsePlaceCoords(body.pickupCoords),
@@ -129,6 +137,12 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
     }
 
     if (typeof req.body.quotedPrice !== 'number' || req.body.quotedPrice !== normalized.price) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
+    if (normalized.scheduled) {
+      const { count, error: countError } = await supabaseAdmin.from('rides').select('id', { count: 'exact', head: true })
+        .eq('parent_id', req.user.id).eq('is_scheduled', true).in('status', scheduling.NOT_STARTED_STATUSES);
+      if (countError) throw countError;
+      if (count >= scheduling.MAX_SCHEDULED_PER_PARENT) return res.status(409).json({ message: `You can have up to ${scheduling.MAX_SCHEDULED_PER_PARENT} upcoming rides. Cancel one to book another.` });
+    }
     const { data, error } = await supabaseAdmin
       .from('rides')
       .insert({
@@ -145,11 +159,19 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
         pickup_coords: normalized.pickupCoords,
         dropoff_coords: normalized.dropoffCoords,
         // With a known pickup point the ride goes to the nearest drivers first.
-        dispatch_state: normalized.pickupCoords ? 'targeted' : 'open'
+        // A ride for later waits (held) until its dispatch window opens.
+        dispatch_state: normalized.pickupCoords && !normalized.scheduled ? 'targeted' : 'open',
+        ...(normalized.scheduled ? { is_scheduled: true } : {})
       })
       .select('id')
       .single();
 
+    if (error?.code === '23505') {
+      // Until the old one-ride-per-parent index is removed, any unfinished ride blocks a new booking.
+      return res.status(409).json({ message: normalized.scheduled
+        ? 'Finish or cancel your current ride before scheduling another one.'
+        : 'You already have a ride in progress. Finish or cancel it before booking another ride now.' });
+    }
     if (error) {
       throw error;
     }
@@ -181,6 +203,7 @@ router.get('/open', protect, async (req, res) => {
     const requestedLimit = Number(req.query.limit) || 20;
     const limit = Math.max(1, Math.min(requestedLimit, 100));
     // Move nearest-driver offers along before deciding what this driver sees.
+    await safely(() => dispatch.releaseDueScheduledRides(), 'Scheduled release failed');
     await safely(async () => {
       const { data: targeted, error: targetedError } = await supabaseAdmin.from('rides').select('id, status, driver_id, dispatch_state, pickup_coords')
         .eq('dispatch_state', 'targeted').in('status', OPEN_REQUEST_STATUSES).is('driver_id', null).limit(20);
@@ -206,7 +229,7 @@ router.get('/open', protect, async (req, res) => {
     // A targeted ride is only visible to the driver it is currently offered to;
     // their own offers come first, with the time left to accept.
     const visibleRides = rides
-      .filter((ride) => !declinedRideIds.has(ride.id))
+      .filter((ride) => !declinedRideIds.has(ride.id) && !scheduling.isHeld(ride))
       .filter((ride) => ride.dispatch_state !== 'targeted' || liveOffers.has(ride.id))
       .sort((a, b) => Number(liveOffers.has(b.id)) - Number(liveOffers.has(a.id)))
       .slice(0, limit)
@@ -220,7 +243,8 @@ router.get('/open', protect, async (req, res) => {
 
 router.get('/active', protect, async (req, res) => {
   try {
-    const activeQuery = () => fetchRideRows(
+    // Rides booked for later stay in the Upcoming lists until shortly before pickup.
+    const activeQuery = async () => (await fetchRideRows(
       supabaseAdmin
         .from('rides')
         .select(RIDE_SELECT)
@@ -228,8 +252,9 @@ router.get('/active', protect, async (req, res) => {
         .neq('status', 'completed')
         .neq('status', 'cancelled')
         .order('updated_at', { ascending: false })
-        .limit(1)
-    );
+        .limit(12)
+    )).filter((candidate) => scheduling.isCurrent(candidate));
+    await safely(() => dispatch.releaseDueScheduledRides(), 'Scheduled release failed');
     let [ride] = await activeQuery();
     if (!ride) return res.json(null);
 
@@ -291,6 +316,42 @@ router.get('/', protect, async (req, res) => {
   }
 });
 
+// Upcoming rides booked for later: a parent's own (not yet started), or the
+// ones a driver has accepted. Soonest first.
+router.get('/scheduled', protect, async (req, res) => {
+  try {
+    if (req.user.role !== 'parent' && !isApprovedDriver(req.user)) return res.status(403).json({ message: 'Parent or approved driver account required' });
+    await safely(() => dispatch.releaseDueScheduledRides(), 'Scheduled release failed');
+    let query = supabaseAdmin.from('rides').select(RIDE_SELECT).eq('is_scheduled', true)
+      .order('pickup_time', { ascending: true }).limit(scheduling.MAX_SCHEDULED_PER_PARENT * 2);
+    query = req.user.role === 'parent'
+      ? query.eq('parent_id', req.user.id).in('status', scheduling.NOT_STARTED_STATUSES)
+      : query.eq('driver_id', req.user.id).eq('status', 'driver_assigned');
+    const rides = await fetchRideRows(query);
+    return res.json(rides.map((ride) => (req.user.role === 'parent' ? formatRide(ride) : redactOffer(formatRide(ride)))));
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
+// Cron: releases due rides for later and moves offers along even when nobody
+// is polling. Vercel Cron (or any scheduler) calls it with CRON_SECRET.
+router.get('/scheduled/dispatch', async (req, res) => {
+  const expected = `Bearer ${process.env.CRON_SECRET || ''}`;
+  const actual = req.headers.authorization || '';
+  if (!process.env.CRON_SECRET || actual.length !== expected.length || !timingSafeEqual(Buffer.from(actual), Buffer.from(expected))) return res.status(401).json({ message: 'Not authorized' });
+  try {
+    const released = await dispatch.releaseDueScheduledRides();
+    const { data: targeted, error } = await supabaseAdmin.from('rides').select('id, status, driver_id, dispatch_state, pickup_coords')
+      .eq('dispatch_state', 'targeted').in('status', OPEN_REQUEST_STATUSES).is('driver_id', null).limit(50);
+    if (error) throw error;
+    for (const ride of targeted || []) await dispatch.advanceDispatch(ride);
+    return res.json({ released, advanced: (targeted || []).length });
+  } catch (error) {
+    return sendError(res, error, 'Scheduled dispatch failed');
+  }
+});
+
 router.get('/summary', protect, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
   try {
@@ -343,6 +404,29 @@ router.get('/:id', protect, async (req, res) => {
   }
 });
 
+// The parent moves a ride booked for later, until it is offered to drivers.
+router.put('/:id/schedule', protect, async (req, res) => {
+  try {
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride || ride.parent_id !== req.user.id) return res.status(404).json({ message: 'Ride not found' });
+    if (!ride.is_scheduled) return res.status(409).json({ message: 'Only rides booked for later can be rescheduled' });
+    if (!scheduling.isHeld(ride)) return res.status(409).json({ message: 'Drivers are already being contacted for this ride, so its time can no longer be changed. Cancel it and book again instead.' });
+    const pickupTime = new Date(req.body.pickupTime);
+    const timeError = scheduling.validateScheduledTime(pickupTime);
+    if (timeError) return res.status(400).json({ message: timeError });
+    // Only while still held: a release in the meantime wins.
+    const { data, error } = await supabaseAdmin.from('rides')
+      .update({ pickup_time: pickupTime.toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', ride.id).eq('status', ride.status).is('dispatch_released_at', null)
+      .select(RIDE_SELECT).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(409).json({ message: 'Drivers are already being contacted for this ride, so its time can no longer be changed.' });
+    return res.json(formatRide(data));
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
 router.put('/:id/accept', protect, async (req, res) => {
   try {
     if (!isApprovedDriver(req.user) && req.user.role !== 'admin') {
@@ -366,6 +450,9 @@ router.put('/:id/accept', protect, async (req, res) => {
     }
     if (existingRide.driver_id && existingRide.driver_id !== req.user.id) {
       return res.status(409).json({ message: 'Ride already accepted by another driver' });
+    }
+    if (req.user.role !== 'admin' && scheduling.isHeld(existingRide)) {
+      return res.status(409).json({ message: 'This ride is booked for later and is not open to drivers yet.' });
     }
     if (req.user.role !== 'admin' && existingRide.dispatch_state === 'targeted') {
       const liveOffers = await dispatch.fetchLiveOffers(req.user.id);
@@ -502,7 +589,14 @@ router.put('/:id/status', protect, async (req, res) => {
       return res.status(403).json({ message: 'Only drivers can update ride status' });
     }
 
-    const updatedRide = await updateRideRow(req.params.id, { status: ride.status, ...(TERMINAL_STATUSES.has(ride.status) ? { driver_location: null } : {}) }, expectedStatus, req.user.role === 'driver' ? req.user.id : undefined);
+    let updatedRide;
+    try {
+      updatedRide = await updateRideRow(req.params.id, { status: ride.status, ...(TERMINAL_STATUSES.has(ride.status) ? { driver_location: null } : {}) }, expectedStatus, req.user.role === 'driver' ? req.user.id : undefined);
+    } catch (updateError) {
+      // Starting a ride booked for later while another trip is still under way.
+      if (updateError?.code === '23505') return res.status(409).json({ message: 'Finish your current trip before starting this one.' });
+      throw updateError;
+    }
     await notifyRide(updatedRide);
     const payload = formatRide(updatedRide);
     const io = req.app.get('io');
