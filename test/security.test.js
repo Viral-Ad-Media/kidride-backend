@@ -17,7 +17,7 @@ function response() { return { code: 200, headers: {}, status(n) { this.code=n; 
 function routes(repository = {}, database = {}) {
   const handlers = {};
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
-  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/dispatch': { advanceDispatch: async () => {}, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] } });
+  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] } });
   return handlers;
 }
 test('approval requires role, verification and approved status together', () => {
@@ -377,4 +377,98 @@ test('admin live map lists online drivers as free or on a ride, with rides in pr
   assert.deepEqual(res.body.drivers.map((d) => `${d.name}:${d.status}`), ['Ada:on_ride', 'Ben:free']);
   assert.deepEqual({ ...res.body.counts }, { online: 2, onRide: 1, ridesInProgress: 1, searching: 1 });
   assert.equal(res.body.rides.find((r) => r.id === 'r1').driverName, 'Ada');
+});
+const scheduling = require('../lib/scheduling');
+const at = (ms) => new Date(Date.now() + ms).toISOString();
+const MIN = 60 * 1000;
+const slot = (ms) => { const d = new Date(Date.now() + ms); d.setUTCSeconds(0, 0); d.setUTCMinutes(Math.ceil(d.getUTCMinutes() / 5) * 5); return d; };
+
+test('rides for later: 30 min to 30 days ahead, 5-minute steps', () => {
+  assert.equal(scheduling.validateScheduledTime(slot(45 * MIN)), null);
+  assert.equal(scheduling.validateScheduledTime(slot(29 * 24 * 60 * MIN)), null);
+  assert.match(scheduling.validateScheduledTime(slot(10 * MIN)), /at least 30 minutes/);
+  assert.match(scheduling.validateScheduledTime(slot(31 * 24 * 60 * MIN)), /30 days/);
+  const odd = slot(60 * MIN); odd.setUTCMinutes(odd.getUTCMinutes() + 2);
+  assert.match(scheduling.validateScheduledTime(odd), /5-minute/);
+  assert.match(scheduling.validateScheduledTime(new Date('nope')), /valid/);
+});
+test('rides for later: held until released, current 15 min before pickup, needs attention 5 min before with no driver', () => {
+  const held = { is_scheduled: true, status: 'searching_driver', driver_id: null, dispatch_released_at: null, pickup_time: at(3 * 60 * MIN) };
+  assert.equal(scheduling.isHeld(held), true);
+  assert.equal(scheduling.isCurrent(held), false);
+  assert.equal(scheduling.scheduleState(held), 'scheduled');
+  const dispatching = { ...held, dispatch_released_at: at(0), pickup_time: at(20 * MIN) };
+  assert.equal(scheduling.isHeld(dispatching), false);
+  assert.equal(scheduling.scheduleState(dispatching), 'dispatching');
+  assert.equal(scheduling.isCurrent(dispatching), false);
+  assert.equal(scheduling.isCurrent({ ...dispatching, pickup_time: at(14 * MIN) }), true);
+  assert.equal(scheduling.scheduleState({ ...dispatching, pickup_time: at(4 * MIN) }), 'needs_attention');
+  assert.equal(scheduling.needsAttention({ ...dispatching, pickup_time: at(4 * MIN), driver_id: 'd', status: 'driver_assigned' }), false);
+  const accepted = { ...dispatching, driver_id: 'd', status: 'driver_assigned', pickup_time: at(25 * MIN) };
+  assert.equal(scheduling.keepsDriverBusy(accepted), false);
+  assert.equal(scheduling.keepsDriverBusy({ ...accepted, pickup_time: at(10 * MIN) }), true);
+  assert.equal(scheduling.keepsDriverBusy({ ...accepted, status: 'driver_arrived_at_pickup' }), true);
+  assert.equal(scheduling.isCurrent({ status: 'driver_assigned' }), true); // rides for now are unaffected
+  assert.equal(scheduling.scheduleState({ status: 'searching_driver' }), null);
+});
+test('scheduled rides are released 30 min before pickup into nearest-driver dispatch; later ones stay held', async () => {
+  const { db, log } = fakeDb({
+    rides: [
+      { id: 'due', is_scheduled: true, dispatch_released_at: null, driver_id: null, status: 'searching_driver', pickup_coords: pickup, pickup_time: at(25 * MIN), dispatch_state: 'open' },
+      { id: 'later', is_scheduled: true, dispatch_released_at: null, driver_id: null, status: 'searching_driver', pickup_coords: pickup, pickup_time: at(3 * 60 * MIN), dispatch_state: 'open' },
+      { id: 'now', is_scheduled: false, driver_id: null, status: 'searching_driver', pickup_coords: pickup, pickup_time: at(0), dispatch_state: 'open' }
+    ],
+    driver_locations: [nearDriver('near', 51.5036, -0.1278)],
+    profiles: [approved('near')],
+    ride_offers: []
+  });
+  assert.equal(await loadDispatch(db).releaseDueScheduledRides(), 1);
+  const releases = log.filter((e) => e.table === 'rides' && e.op === 'update');
+  assert.equal(releases.length, 1);
+  assert.equal(releases[0].payload.dispatch_state, 'targeted');
+  assert.equal(releases[0].count, 1);
+  const offer = log.find((e) => e.table === 'ride_offers' && e.op === 'insert');
+  assert.equal(offer.payload.ride_id, 'due');
+  assert.equal(offer.payload.driver_id, 'near');
+});
+test('a driver with an accepted ride for later still gets offers until it is near', async () => {
+  const { db } = fakeDb({
+    driver_locations: [nearDriver('free', 51.5036, -0.1278), nearDriver('soon', 51.5035, -0.1277)],
+    profiles: [approved('free'), approved('soon')],
+    rides: [
+      { driver_id: 'free', status: 'driver_assigned', is_scheduled: true, pickup_time: at(3 * 60 * MIN) },
+      { driver_id: 'soon', status: 'driver_assigned', is_scheduled: true, pickup_time: at(10 * MIN) }
+    ]
+  });
+  assert.deepEqual((await loadDispatch(db).findNearbyDrivers(pickup)).map((d) => d.driverId), ['free']);
+});
+test('booking for later validates the time; held rides cannot be accepted; only held rides can be moved', async () => {
+  process.env.SERVICE_PRICES_JSON = '{"pickup_only":25}';
+  const parentUser = { role: 'parent', id: 'parent', children: [{ id: 'own' }] };
+  let res = response();
+  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', quotedPrice: 25, scheduled: true, pickupTime: slot(10 * MIN).toISOString() } }, res);
+  assert.equal(res.code, 400); assert.match(res.body.message, /30 minutes/);
+  res = response();
+  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', quotedPrice: 25, scheduled: true } }, res);
+  assert.equal(res.code, 400);
+
+  const heldRide = { id: 'r', parent_id: 'parent', status: 'searching_driver', is_scheduled: true, dispatch_released_at: null, driver_id: null, pickup_time: at(3 * 60 * MIN), dispatch_state: 'open' };
+  const driver = { id: 'd', role: 'driver', isVerifiedDriver: true, driverApplicationStatus: 'approved' };
+  res = response(); await routes({ fetchRideRowById: async () => heldRide })['put /:id/accept']({ user: driver, params: { id: 'r' } }, res);
+  assert.equal(res.code, 409); assert.match(res.body.message, /booked for later/);
+
+  res = response(); await routes({ fetchRideRowById: async () => heldRide })['put /:id/schedule']({ user: { id: 'someone', role: 'parent' }, params: { id: 'r' }, body: {} }, res);
+  assert.equal(res.code, 404);
+  res = response(); await routes({ fetchRideRowById: async () => ({ ...heldRide, dispatch_released_at: at(0) }) })['put /:id/schedule']({ user: { id: 'parent', role: 'parent' }, params: { id: 'r' }, body: { pickupTime: slot(2 * 60 * MIN).toISOString() } }, res);
+  assert.equal(res.code, 409);
+  res = response(); await routes({ fetchRideRowById: async () => heldRide })['put /:id/schedule']({ user: { id: 'parent', role: 'parent' }, params: { id: 'r' }, body: { pickupTime: slot(5 * MIN).toISOString() } }, res);
+  assert.equal(res.code, 400);
+});
+test('the current ride skips rides booked for later until 15 minutes before pickup', async () => {
+  const chain = { select() { return chain; }, or() { return chain; }, neq() { return chain; }, order() { return chain; }, limit() { return chain; } };
+  const later = { id: 'later', parent_id: 'p', status: 'searching_driver', is_scheduled: true, pickup_time: at(2 * 60 * MIN) };
+  const soon = { id: 'soon', parent_id: 'p', status: 'driver_assigned', driver_id: 'd', is_scheduled: true, pickup_time: at(10 * MIN) };
+  const run = async (rows) => { const res = response(); await routes({ fetchRideRows: async () => rows, formatRide: (r) => ({ id: r.id }) }, { from: () => chain })['get /active']({ user: { id: 'p', role: 'parent' } }, res); return res.body; };
+  assert.equal(await run([later]), null);
+  assert.equal((await run([later, soon])).id, 'soon');
 });
