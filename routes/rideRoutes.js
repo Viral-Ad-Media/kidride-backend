@@ -7,6 +7,7 @@ const {
   fetchRideRowById,
   fetchRideRows,
   formatRide,
+  formatRideFor,
   updateRideRow
 } = require('../lib/repository');
 
@@ -20,10 +21,23 @@ const { loadPricing } = require('../lib/pricingSettings');
 const { cancellationFee } = require('../lib/pricing');
 const { quoteAllServices, verifyQuote } = require('../lib/fareQuotes');
 const { timingSafeEqual } = require('node:crypto');
+const { loadSafety } = require('../lib/safetySettings');
+const { DEFAULT_SAFETY, normalizeSafety, tripCodeMatches, evaluatePosition, noShowTerms } = require('../lib/safety');
+const { recordIncident, listIncidents, resolveIncidents } = require('../lib/incidents');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
 const router = express.Router();
+
+// Safety checks fall back to the default thresholds if settings cannot load.
+const safetySettings = async () => (await safely(loadSafety, 'Safety settings failed')) || normalizeSafety(DEFAULT_SAFETY);
+// Parent and driver each get their own view of a ride (the driver never sees the trip code).
+const emitRideUpdate = (req, ride, event = 'ride_status_updated') => {
+  const io = req.app.get('io');
+  if (!io) return;
+  io.to(ride.parent_id).emit(event, formatRide(ride));
+  if (ride.driver_id) io.to(ride.driver_id).emit(event, formatRideFor({ id: ride.driver_id, role: 'driver' }, ride));
+};
 
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
 const OPEN_REQUEST_STATUSES = ['requested', 'searching_driver'];
@@ -282,7 +296,7 @@ router.get('/active', protect, async (req, res) => {
       }
     }
     if (!ride) return res.json(null);
-    return res.json(searchInfo ? { ...formatRide(ride), dispatch: searchInfo } : formatRide(ride));
+    return res.json(searchInfo ? { ...formatRideFor(req.user, ride), dispatch: searchInfo } : formatRideFor(req.user, ride));
   } catch (error) {
     return sendError(res, error);
   }
@@ -313,7 +327,7 @@ router.get('/', protect, async (req, res) => {
     }
 
     const rides = await fetchRideRows(query);
-    const formatted = rides.map(formatRide);
+    const formatted = rides.map((ride) => formatRideFor(req.user, ride));
     // Parents see which of their rides they have already rated.
     if (req.user.role === 'parent' && formatted.length) {
       const { data: ratings, error: ratingError } = await supabaseAdmin.from('ride_ratings').select('ride_id, stars, comment').in('ride_id', formatted.map((ride) => ride.id));
@@ -403,7 +417,15 @@ router.put('/:id/location', protect, async (req, res) => {
     if (!ride || ride.driver_id !== req.user.id) return res.status(403).json({ message: 'Assigned driver required' });
     if (!ACTIVE_STATUSES.includes(ride.status)) return res.status(409).json({ message: 'Ride is not active' });
     const driver_location = { latitude: req.body.latitude, longitude: req.body.longitude, accuracy: req.body.accuracy ?? null, heading: req.body.heading ?? null, speed: req.body.speed ?? null, recordedAt: new Date().toISOString() };
-    await updateRideRow(ride.id, { driver_location }, ride.status, req.user.id);
+    // With the child onboard, watch for the car leaving the route or stopping. Fixes
+    // vaguer than 200 m are skipped so poor GPS does not raise false alarms.
+    const watch = ride.status === 'child_picked_up' && !(req.body.accuracy > 200)
+      ? await safely(async () => evaluatePosition(await safetySettings(), ride, { lat: req.body.latitude, lng: req.body.longitude }), 'Route watch failed')
+      : null;
+    const updated = await updateRideRow(ride.id, { driver_location, ...(watch ? { monitor: watch.monitor } : {}) }, ride.status, req.user.id);
+    for (const alert of watch?.alerts || []) {
+      await safely(() => recordIncident(updated, alert.kind, { location: driver_location, details: alert.details }), 'Route alert failed');
+    }
     return res.json(driver_location);
   } catch (error) { return sendError(res, error); }
 });
@@ -417,7 +439,7 @@ router.get('/:id', protect, async (req, res) => {
     if (!canAccessRide(req.user, ride)) {
       return res.status(403).json({ message: 'Not authorized to access this ride' });
     }
-    return res.json(formatRide(ride));
+    return res.json(formatRideFor(req.user, ride));
   } catch (error) {
     return sendError(res, error);
   }
@@ -461,7 +483,7 @@ router.put('/:id/accept', protect, async (req, res) => {
     }
 
     if (existingRide.status === 'driver_assigned' && existingRide.driver_id === req.user.id) {
-      return res.json(formatRide(existingRide));
+      return res.json(formatRideFor(req.user, existingRide));
     }
 
     if (!OPEN_REQUEST_STATUSES.includes(existingRide.status) && existingRide.status !== 'driver_assigned') {
@@ -517,7 +539,7 @@ router.put('/:id/accept', protect, async (req, res) => {
     }
 
     await notifyRideEvent(data);
-    return res.json(payload);
+    return res.json(formatRideFor(req.user, data));
   } catch (error) {
     return sendError(res, error);
   }
@@ -587,6 +609,7 @@ router.put('/:id/status', protect, async (req, res) => {
     }
 
     const expectedStatus = ride.status;
+    const extraUpdates = {};
     if (req.user.role === 'admin') {
       if (TERMINAL_STATUSES.has(ride.status)) return res.status(409).json({ message: 'Terminal rides cannot be reopened' });
       ride.status = status;
@@ -603,6 +626,12 @@ router.put('/:id/status', protect, async (req, res) => {
           message: `Invalid status transition from ${ride.status} to ${status}`
         });
       }
+      // The child only gets in once the driver has entered the parent's trip code.
+      if (status === 'child_picked_up' && !ride.trip_code_verified_at) {
+        const failure = await checkTripCode(ride, req.body.tripCode, req.user);
+        if (failure) return res.status(failure.status).json(failure.body);
+        extraUpdates.trip_code_verified_at = new Date().toISOString();
+      }
       ride.status = status;
     } else {
       return res.status(403).json({ message: 'Only drivers can update ride status' });
@@ -610,25 +639,41 @@ router.put('/:id/status', protect, async (req, res) => {
 
     let updatedRide;
     try {
-      updatedRide = await updateRideRow(req.params.id, { status: ride.status, ...(TERMINAL_STATUSES.has(ride.status) ? { driver_location: null } : {}) }, expectedStatus, req.user.role === 'driver' ? req.user.id : undefined);
+      if (ride.status === 'driver_arrived_at_pickup' && expectedStatus !== ride.status) extraUpdates.arrived_at = new Date().toISOString();
+      updatedRide = await updateRideRow(req.params.id, { status: ride.status, ...extraUpdates, ...(TERMINAL_STATUSES.has(ride.status) ? { driver_location: null } : {}) }, expectedStatus, req.user.role === 'driver' ? req.user.id : undefined);
     } catch (updateError) {
       // Starting a ride booked for later while another trip is still under way.
       if (updateError?.code === '23505') return res.status(409).json({ message: 'Finish your current trip before starting this one.' });
       throw updateError;
     }
     await notifyRideEvent(updatedRide);
-    const payload = formatRide(updatedRide);
-    const io = req.app.get('io');
-
-    if (io) {
-      io.to([updatedRide.parent_id, updatedRide.driver_id].filter(Boolean)).emit('ride_status_updated', payload);
-    }
-
-    return res.json(payload);
+    emitRideUpdate(req, updatedRide);
+    return res.json(formatRideFor(req.user, updatedRide));
   } catch (error) {
     return sendError(res, error);
   }
 });
+
+const LOCKED_MESSAGE = 'Too many wrong trip codes. This pickup is locked and KidRide support will contact the parent. Do not let the child get in.';
+// Returns null when the entered code matches, else the response to send. Every
+// wrong code is counted, recorded as an incident and sent to the parent and admins.
+const checkTripCode = async (ride, entered, user) => {
+  const max = (await safetySettings()).tripCodeMaxAttempts;
+  const attempts = Number(ride.trip_code_attempts) || 0;
+  if (attempts >= max) return { status: 423, body: { message: LOCKED_MESSAGE, locked: true, attemptsLeft: 0 } };
+  const code = typeof entered === 'number' ? String(entered) : typeof entered === 'string' ? entered.trim() : '';
+  if (!code) return { status: 400, body: { message: 'Enter the 4-digit trip code the parent gives you.', attemptsLeft: max - attempts } };
+  if (tripCodeMatches(code, ride.trip_code)) return null;
+  const attempt = attempts + 1;
+  const { data, error } = await supabaseAdmin.from('rides').update({ trip_code_attempts: attempt })
+    .eq('id', ride.id).eq('trip_code_attempts', attempts).select(RIDE_SELECT).maybeSingle();
+  if (error) throw error;
+  if (!data) return { status: 409, body: { message: 'Ride changed. Enter the code again.' } };
+  const locked = attempt >= max;
+  await safely(() => recordIncident(data, 'trip_code', { userId: user.id, role: 'driver', location: data.driver_location || null, details: { attempt, maxAttempts: max, locked } }), 'Trip code incident failed');
+  const left = max - attempt;
+  return { status: locked ? 423 : 422, body: { message: locked ? LOCKED_MESSAGE : `That code does not match. Ask for the 4-digit trip code. ${left} ${left === 1 ? 'try' : 'tries'} left.`, locked, attemptsLeft: left } };
+};
 
 // Pricing outages never block a cancellation; the fee is then waived.
 const parentCancellationFee = async (ride, byParent) => {
@@ -672,17 +717,97 @@ router.put('/:id/cancel', protect, async (req, res) => {
     const fee = await parentCancellationFee(ride, isParent && !isAdmin);
     const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled', driver_location: null, cancellation_fee: fee }, ride.status);
     await notifyRideEvent(updatedRide);
-    const payload = formatRide(updatedRide);
-    const io = req.app.get('io');
-
-    if (io) {
-      io.to([updatedRide.parent_id, updatedRide.driver_id].filter(Boolean)).emit('ride_status_updated', payload);
-    }
-
-    return res.json(payload);
+    emitRideUpdate(req, updatedRide);
+    return res.json(formatRideFor(req.user, updatedRide));
   } catch (error) {
     return sendError(res, error);
   }
+});
+
+// SOS from the parent or the driver of an unfinished ride: recorded as an incident
+// with the time, who and where, flagged for admins and sent to them. The app asks
+// for confirmation first; `confirm: true` must come with the request.
+const sosLimiter = createRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  max: 5,
+  message: 'SOS already sent. KidRide support has been alerted. If anyone is in danger, call 911.',
+  keyPrefix: 'sos',
+  keyGenerator: (req) => (req.user && req.user.id ? `user:${req.user.id}` : null)
+});
+router.post('/:id/sos', protect, sosLimiter, async (req, res) => {
+  if (req.body.confirm !== true) return res.status(400).json({ message: 'Confirm the SOS to send it.' });
+  try {
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride) return res.status(404).json({ message: 'Ride not found' });
+    const role = ride.parent_id === req.user.id ? 'parent' : ride.driver_id === req.user.id ? 'driver' : null;
+    if (!role) return res.status(403).json({ message: 'Only the parent or driver of this ride can raise an SOS' });
+    if (TERMINAL_STATUSES.has(ride.status)) return res.status(409).json({ message: 'This ride has ended. If anyone is in danger, call 911.' });
+    const sent = req.body.location || {};
+    const location = validateCoordinates(sent)
+      ? { latitude: sent.latitude, longitude: sent.longitude, accuracy: sent.accuracy ?? null, source: role }
+      : ride.driver_location ? { ...ride.driver_location, source: 'driver_gps' } : null;
+    const note = typeof req.body.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+    const { incident, ride: updated } = await recordIncident(ride, 'sos', {
+      userId: req.user.id,
+      role,
+      location,
+      details: { ...(note ? { note } : {}), ...(location ? { where: `${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)}` } : {}) }
+    });
+    emitRideUpdate(req, updated, 'ride_safety_alert');
+    return res.status(201).json({ incident, ride: formatRideFor(req.user, updated) });
+  } catch (error) {
+    return sendError(res, error, 'Could not send the SOS. Call 911 if anyone is in danger.');
+  }
+});
+
+// Incidents on a ride: admins and the ride's parent.
+router.get('/:id/incidents', protect, async (req, res) => {
+  try {
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride) return res.status(404).json({ message: 'Ride not found' });
+    if (req.user.role !== 'admin' && ride.parent_id !== req.user.id) return res.status(403).json({ message: 'Not authorized' });
+    return res.json({ incidents: await listIncidents(ride.id) });
+  } catch (error) { return sendError(res, error); }
+});
+
+// Admin: mark the ride's open incidents handled and clear its flag.
+router.put('/:id/incidents/resolve', protect, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Admin required' });
+  try {
+    const ride = await resolveIncidents(req.params.id, req.user.id);
+    if (!ride) return res.status(404).json({ message: 'Ride not found' });
+    return res.json(formatRide(ride));
+  } catch (error) { return sendError(res, error); }
+});
+
+// No-show: once the driver has waited the configured time at the pickup they can
+// cancel the ride; the parent pays the no-show fee from the pricing settings.
+const loadNoShow = async (req, res) => {
+  if (!isApprovedDriver(req.user)) { res.status(403).json({ message: 'Approved driver required' }); return null; }
+  const ride = await fetchRideRowById(req.params.id);
+  if (!ride || ride.driver_id !== req.user.id) { res.status(404).json({ message: 'Ride not found' }); return null; }
+  const pricing = await loadPricing();
+  return { ride, pricing, terms: noShowTerms(pricing, ride) };
+};
+router.get('/:id/no-show', protect, async (req, res) => {
+  try {
+    const loaded = await loadNoShow(req, res);
+    if (!loaded) return undefined;
+    return res.json({ ...loaded.terms, currency: loaded.ride.currency || 'USD', waitMinutes: loaded.pricing.cancellation.noShowWaitMinutes });
+  } catch (error) { return sendError(res, error); }
+});
+router.put('/:id/no-show', protect, async (req, res) => {
+  try {
+    const loaded = await loadNoShow(req, res);
+    if (!loaded) return undefined;
+    const { ride, terms } = loaded;
+    if (ride.status !== 'driver_arrived_at_pickup') return res.status(409).json({ message: 'Mark that you have arrived at the pickup first.' });
+    if (!terms.allowed) return res.status(409).json({ message: 'Keep waiting a little longer before recording a no-show.', availableAt: terms.availableAt });
+    const updated = await updateRideRow(ride.id, { status: 'cancelled', driver_location: null, cancellation_fee: terms.fee, cancel_reason: 'no_show' }, 'driver_arrived_at_pickup', req.user.id);
+    await notifyRideEvent(updated, 'no_show');
+    emitRideUpdate(req, updated);
+    return res.json(formatRideFor(req.user, updated));
+  } catch (error) { return sendError(res, error); }
 });
 
 // The parent rates the driver of their completed ride once: 1-5 stars and an optional comment.
