@@ -5,8 +5,8 @@ const vm = require('node:vm');
 const path = require('node:path');
 const security = require('../lib/security');
 const { createRateLimiter, getClientIdentifier } = require('../middleware/rateLimitMiddleware');
-const originalPrices = process.env.SERVICE_PRICES_JSON;
-afterEach(() => { if (originalPrices === undefined) delete process.env.SERVICE_PRICES_JSON; else process.env.SERVICE_PRICES_JSON = originalPrices; });
+const pricing = require('../lib/pricing');
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 function load(relative, mocks) {
   const filename = path.join(__dirname, '..', relative);
   const module = { exports: {} };
@@ -17,17 +17,13 @@ function response() { return { code: 200, headers: {}, status(n) { this.code=n; 
 function routes(repository = {}, database = {}) {
   const handlers = {};
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
-  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] } });
+  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/notifications': { notifyRideEvent: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/pricingSettings': { loadPricing: async () => pricing.normalizeSettings({}) }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] } });
   return handlers;
 }
 test('approval requires role, verification and approved status together', () => {
   const good={role:'driver',isVerifiedDriver:true,driverApplicationStatus:'approved'};
   assert.equal(security.isApprovedDriver(good),true);
   for (const mutation of [{role:'parent'},{isVerifiedDriver:false},{driverApplicationStatus:'pending'},{driverApplicationStatus:'rejected'}]) assert.equal(security.isApprovedDriver({...good,...mutation}),false);
-});
-test('fares fail closed for absent, malformed, negative or fractional-cent configuration', () => {
-  for (const raw of ['{}','invalid','{"pickup_only":-1}','{"pickup_only":1.001}','{"pickup_only":"25"}']) { process.env.SERVICE_PRICES_JSON=raw; assert.throws(() => security.quoteFare('pickup_only'),error => error.status===503); }
-  process.env.SERVICE_PRICES_JSON='{"pickup_only":25.5}'; assert.equal(security.quoteFare('pickup_only'),25.5);
 });
 test('offer redaction removes child, parent and handoff credentials without changing participant payload', () => {
   const ride={id:'ride',child:'child',parent:'parent',tripCode:'1234',safeWord:'secret',price:25};
@@ -49,8 +45,14 @@ test('unapproved drivers cannot list offers or accept rides', async () => {
 test('booking rejects a child belonging to a different account before database access', async () => {
   const res=response();await routes()['post /request']({user:{role:'parent',id:'parent',children:[{id:'own'}]},body:{childId:'other'}},res);assert.equal(res.code,403);
 });
-test('booking rejects a stale or missing quote rather than accepting client price', async () => {
-  process.env.SERVICE_PRICES_JSON='{"pickup_only":25}';for(const quotedPrice of [undefined,1,'25']) { const res=response();await routes()['post /request']({user:{role:'parent',id:'parent',children:[{id:'own'}]},body:{childId:'own',pickup:'A',dropoff:'B',price:1,quotedPrice}},res);assert.equal(res.code,409); }
+test('booking rejects a missing, forged or different-trip quote rather than accepting a client price', async () => {
+  const { quoteAllServices } = require('../lib/fareQuotes');
+  const a = { lat: 51.5, lng: -0.12 }, b = { lat: 51.52, lng: -0.1 };
+  const { quotes } = await quoteAllServices(pricing.normalizeSettings({}), 'parent', { pickupCoords: a, dropoffCoords: b, scheduledAt: null, stayMinutes: 60 });
+  const body = { childId: 'own', pickup: 'A', dropoff: 'B', pickupCoords: a, dropoffCoords: b, serviceType: 'pickup_only', price: 1 };
+  const cases = [{}, { quoteToken: 'forged' }, { quoteToken: quotes.dropoff_only.quoteToken }, { quoteToken: quotes.pickup_only.quoteToken, dropoffCoords: { lat: 51.6, lng: -0.1 } }];
+  for (const extra of cases) { const res=response();await routes()['post /request']({user:{role:'parent',id:'parent',children:[{id:'own'}]},body:{...body,...extra}},res);assert.equal(res.code,409); }
+  const res=response();await routes()['post /request']({user:{role:'parent',id:'someone-else',children:[{id:'own'}]},body:{...body,quoteToken:quotes.pickup_only.quoteToken}},res);assert.equal(res.code,409);
 });
 test('ride writes compare the expected status and assigned driver and report conflicts', async () => {
   const filters=[]; const query={update(){return this;},eq(k,v){filters.push([k,v]);return this;},select(){return this;},async maybeSingle(){return {data:null,error:null};}};
@@ -444,13 +446,12 @@ test('a driver with an accepted ride for later still gets offers until it is nea
   assert.deepEqual((await loadDispatch(db).findNearbyDrivers(pickup)).map((d) => d.driverId), ['free']);
 });
 test('booking for later validates the time; held rides cannot be accepted; only held rides can be moved', async () => {
-  process.env.SERVICE_PRICES_JSON = '{"pickup_only":25}';
   const parentUser = { role: 'parent', id: 'parent', children: [{ id: 'own' }] };
   let res = response();
-  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', quotedPrice: 25, scheduled: true, pickupTime: slot(10 * MIN).toISOString() } }, res);
+  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', scheduled: true, pickupTime: slot(10 * MIN).toISOString() } }, res);
   assert.equal(res.code, 400); assert.match(res.body.message, /30 minutes/);
   res = response();
-  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', quotedPrice: 25, scheduled: true } }, res);
+  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', scheduled: true } }, res);
   assert.equal(res.code, 400);
 
   const heldRide = { id: 'r', parent_id: 'parent', status: 'searching_driver', is_scheduled: true, dispatch_released_at: null, driver_id: null, pickup_time: at(3 * 60 * MIN), dispatch_state: 'open' };

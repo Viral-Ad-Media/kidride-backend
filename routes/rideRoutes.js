@@ -10,12 +10,15 @@ const {
   updateRideRow
 } = require('../lib/repository');
 
-const { isApprovedDriver, ACTIVE_STATUSES, quoteFare, redactOffer, generateTripCode, generateSafeWord, validateCoordinates, parsePlaceCoords } = require('../lib/security');
+const { isApprovedDriver, ACTIVE_STATUSES, redactOffer, generateTripCode, generateSafeWord, validateCoordinates, parsePlaceCoords } = require('../lib/security');
 const { notifyRideEvent } = require('../lib/notifications');
 const { sendError } = require('../lib/http');
 const { MAX_COMMENT_LENGTH } = require('../lib/ratings');
 const dispatch = require('../lib/dispatch');
 const scheduling = require('../lib/scheduling');
+const { loadPricing } = require('../lib/pricingSettings');
+const { cancellationFee } = require('../lib/pricing');
+const { quoteAllServices, verifyQuote } = require('../lib/fareQuotes');
 const { timingSafeEqual } = require('node:crypto');
 
 // Dispatch failures must never break booking, offers or tracking.
@@ -68,15 +71,10 @@ const normalizeRideRequestPayload = (body) => {
   const child = body.childId || body.child;
   const pickupLocation = body.pickupLocation || body.pickup;
   const dropoffLocation = body.dropoffLocation || body.dropoff;
-  let price;
-  try { price = quoteFare(body.serviceType || 'pickup_only'); } catch (error) { return { error: error.message, status: error.status }; }
   const pickupTime = body.pickupTime ? new Date(body.pickupTime) : undefined;
 
   if (typeof child !== 'string' || typeof pickupLocation !== 'string' || !pickupLocation.trim() || typeof dropoffLocation !== 'string' || !dropoffLocation.trim()) {
     return { error: 'childId, pickup/pickupLocation, and dropoff/dropoffLocation are required' };
-  }
-  if (!Number.isFinite(price) || price < 0) {
-    return { error: 'Valid ride price is required' };
   }
   if (pickupTime && Number.isNaN(pickupTime.getTime())) {
     return { error: 'pickupTime must be a valid date' };
@@ -96,8 +94,8 @@ const normalizeRideRequestPayload = (body) => {
     dropoffLocation: String(dropoffLocation).trim(),
     pickupTime,
     scheduled,
-    price,
     serviceType: body.serviceType || 'pickup_only',
+    stayMinutes: Number.isInteger(body.stayMinutes) ? body.stayMinutes : 0,
     pickupCoords: parsePlaceCoords(body.pickupCoords),
     dropoffCoords: parsePlaceCoords(body.dropoffCoords)
   };
@@ -136,7 +134,16 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       return res.status(normalized.status || 400).json({ message: normalized.error });
     }
 
-    if (typeof req.body.quotedPrice !== 'number' || req.body.quotedPrice !== normalized.price) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
+    const fare = verifyQuote(req.body.quoteToken, req.user.id, {
+      serviceType: normalized.serviceType,
+      pickupCoords: normalized.pickupCoords,
+      dropoffCoords: normalized.dropoffCoords,
+      pickupAddress: normalized.pickupLocation,
+      dropoffAddress: normalized.dropoffLocation,
+      scheduledAt: normalized.scheduled ? normalized.pickupTime.toISOString() : null,
+      stayMinutes: normalized.stayMinutes
+    });
+    if (!fare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
     if (normalized.scheduled) {
       const { count, error: countError } = await supabaseAdmin.from('rides').select('id', { count: 'exact', head: true })
         .eq('parent_id', req.user.id).eq('is_scheduled', true).in('status', scheduling.NOT_STARTED_STATUSES);
@@ -152,7 +159,10 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
         dropoff_location: normalized.dropoffLocation,
         pickup_time: normalized.pickupTime ? normalized.pickupTime.toISOString() : null,
         status: 'searching_driver',
-        price: normalized.price,
+        price: fare.total,
+        currency: fare.currency,
+        driver_earnings: fare.driverEarnings,
+        fare_breakdown: { lines: fare.lines, miles: fare.miles, minutes: fare.minutes, stayMinutes: fare.stayMinutes, distanceSource: fare.distanceSource },
         trip_code: generateTripCode(),
         safe_word: generateSafeWord(),
         service_type: normalized.serviceType,
@@ -363,18 +373,26 @@ router.get('/summary', protect, async (req, res) => {
   } catch (error) { return sendError(res, error, 'Unable to load ride summary'); }
 });
 
-// Every service type with its current fixed price, so parents can compare before booking.
-router.get('/prices', protect, (req, res) => {
-  try {
-    return res.json({ currency: 'USD', prices: Object.fromEntries(VALID_SERVICE_TYPES.map((type) => [type, quoteFare(type)])) });
-  } catch (error) { return sendError(res, error); }
-});
-
-router.post('/quote', protect, (req, res) => {
+// Fares for every service type over the chosen route, each with a signed quote
+// token that /request accepts for the same trip.
+router.post('/quotes', protect, async (req, res) => {
   if (req.user.role !== 'parent') return res.status(403).json({ message: 'Only parents can obtain quotes' });
-  if (!VALID_SERVICE_TYPES.includes(req.body.serviceType)) return res.status(400).json({ message: 'Invalid service type' });
-  try { return res.json({ price: quoteFare(req.body.serviceType), currency: 'USD' }); }
-  catch (error) { return sendError(res, error); }
+  const pickupCoords = parsePlaceCoords(req.body.pickupCoords);
+  const dropoffCoords = parsePlaceCoords(req.body.dropoffCoords);
+  const pickupAddress = typeof req.body.pickup === 'string' ? req.body.pickup.trim() : '';
+  const dropoffAddress = typeof req.body.dropoff === 'string' ? req.body.dropoff.trim() : '';
+  if (!pickupAddress || !dropoffAddress) return res.status(400).json({ message: 'Enter the pickup and drop-off first.' });
+  let scheduledAt = null;
+  if (req.body.scheduled === true) {
+    const pickupTime = new Date(req.body.pickupTime);
+    const timeError = scheduling.validateScheduledTime(pickupTime);
+    if (timeError) return res.status(400).json({ message: timeError });
+    scheduledAt = pickupTime.toISOString();
+  }
+  const stayMinutes = req.body.stayMinutes === undefined ? 60 : req.body.stayMinutes;
+  if (!Number.isInteger(stayMinutes) || stayMinutes < 0) return res.status(400).json({ message: 'Stay time must be whole minutes' });
+  try { return res.json(await quoteAllServices(await loadPricing(), req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes })); }
+  catch (error) { return sendError(res, error, 'Unable to price this trip'); }
 });
 
 router.put('/:id/location', protect, async (req, res) => {
@@ -612,6 +630,27 @@ router.put('/:id/status', protect, async (req, res) => {
   }
 });
 
+// Pricing outages never block a cancellation; the fee is then waived.
+const parentCancellationFee = async (ride, byParent) => {
+  if (!byParent) return 0;
+  return (await safely(async () => cancellationFee(await loadPricing(), {
+    total: Number(ride.price),
+    createdAt: ride.created_at,
+    pickupTime: ride.pickup_time || ride.created_at,
+    isScheduled: !!ride.is_scheduled,
+    driverAssigned: !!ride.driver_id
+  }), 'Cancellation fee failed')) || 0;
+};
+
+// What cancelling now would cost the parent, shown before they confirm.
+router.get('/:id/cancellation-fee', protect, async (req, res) => {
+  try {
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride || ride.parent_id !== req.user.id) return res.status(404).json({ message: 'Ride not found' });
+    return res.json({ fee: await parentCancellationFee(ride, true), currency: ride.currency || 'USD' });
+  } catch (error) { return sendError(res, error); }
+});
+
 router.put('/:id/cancel', protect, async (req, res) => {
   try {
     const ride = await fetchRideRowById(req.params.id);
@@ -630,7 +669,8 @@ router.put('/:id/cancel', protect, async (req, res) => {
     }
 
     if (ride.status === 'child_picked_up' && !isAdmin) return res.status(409).json({ message: 'A trip with a child onboard cannot be cancelled. Contact support.' });
-    const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled', driver_location: null }, ride.status);
+    const fee = await parentCancellationFee(ride, isParent && !isAdmin);
+    const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled', driver_location: null, cancellation_fee: fee }, ride.status);
     await notifyRideEvent(updatedRide);
     const payload = formatRide(updatedRide);
     const io = req.app.get('io');
