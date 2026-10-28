@@ -34,9 +34,12 @@ try {
   router.use('/users', require('./routes/userRoutes'));
   router.use('/drivers', require('./routes/driverRoutes'));
   router.use('/admin/live-map', require('./routes/adminLiveRoutes'));
+  router.use('/admin/pricing', require('./routes/adminPricingRoutes'));
+  router.use('/admin/safety', require('./routes/adminSafetyRoutes'));
   router.use('/rides', require('./routes/rideRoutes'));
   router.use('/safety-chat', require('./routes/safetyRoutes'));
   router.use('/notification-receipts', require('./routes/receiptRoutes'));
+  router.use('/notifications', require('./routes/notificationRoutes'));
   apiRouter = router;
 } catch (error) {
   // Variable names and stack traces belong in runtime logs, never HTTP responses.

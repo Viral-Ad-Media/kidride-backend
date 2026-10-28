@@ -18,7 +18,7 @@ router.get('/', protect, async (req, res) => {
     const [locations, rides] = await Promise.all([
       supabaseAdmin.from('driver_locations').select('driver_id, lat, lng, heading, updated_at').gte('updated_at', since),
       supabaseAdmin.from('rides')
-        .select('id, status, driver_id, pickup_location, dropoff_location, pickup_coords, dropoff_coords, dispatch_state, driver_location, created_at')
+        .select('id, status, driver_id, pickup_location, dropoff_location, pickup_coords, dropoff_coords, dispatch_state, driver_location, safety_alert, safety_alert_at, created_at')
         .in('status', IN_PROGRESS_STATUSES)
         .order('created_at', { ascending: false })
         .limit(200)
@@ -68,6 +68,8 @@ router.get('/', protect, async (req, res) => {
       driverName: ride.driver_id ? nameById.get(ride.driver_id) || null : null,
       // During a trip the ride's own GPS fix is the most recent driver position.
       driverLocation: ride.driver_location || null,
+      safetyAlert: ride.safety_alert || null,
+      safetyAlertAt: ride.safety_alert_at || null,
       createdAt: ride.created_at
     }));
 
@@ -77,7 +79,8 @@ router.get('/', protect, async (req, res) => {
         online: drivers.length,
         onRide: drivers.filter((driver) => driver.status === 'on_ride').length,
         ridesInProgress: activeRides.filter((ride) => BUSY_STATUSES.includes(ride.status)).length,
-        searching: activeRides.filter((ride) => !ride.driverId).length
+        searching: activeRides.filter((ride) => !ride.driverId).length,
+        alerts: activeRides.filter((ride) => ride.safetyAlert).length
       },
       drivers,
       rides: activeRides

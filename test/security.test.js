@@ -5,8 +5,8 @@ const vm = require('node:vm');
 const path = require('node:path');
 const security = require('../lib/security');
 const { createRateLimiter, getClientIdentifier } = require('../middleware/rateLimitMiddleware');
-const originalPrices = process.env.SERVICE_PRICES_JSON;
-afterEach(() => { if (originalPrices === undefined) delete process.env.SERVICE_PRICES_JSON; else process.env.SERVICE_PRICES_JSON = originalPrices; });
+const pricing = require('../lib/pricing');
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 function load(relative, mocks) {
   const filename = path.join(__dirname, '..', relative);
   const module = { exports: {} };
@@ -14,20 +14,17 @@ function load(relative, mocks) {
   return module.exports;
 }
 function response() { return { code: 200, headers: {}, status(n) { this.code=n; return this; }, json(body) { this.body=body; return this; }, setHeader(k,v) { this.headers[k]=v; } }; }
-function routes(repository = {}, database = {}) {
+function routes(repository = {}, database = {}, extra = {}) {
   const handlers = {};
+  repository = { formatRideFor: (_user, ride) => (repository.formatRide ? repository.formatRide(ride) : ride), ...repository };
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
-  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] } });
+  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/notifications': { notifyRideEvent: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/pricingSettings': { loadPricing: async () => pricing.normalizeSettings({}) }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] }, '../lib/safetySettings': { loadSafety: async () => require('../lib/safety').normalizeSafety({}) }, '../lib/incidents': { recordIncident: async (ride) => ({ incident: {}, ride }), listIncidents: async () => [], resolveIncidents: async () => null }, ...extra });
   return handlers;
 }
 test('approval requires role, verification and approved status together', () => {
   const good={role:'driver',isVerifiedDriver:true,driverApplicationStatus:'approved'};
   assert.equal(security.isApprovedDriver(good),true);
   for (const mutation of [{role:'parent'},{isVerifiedDriver:false},{driverApplicationStatus:'pending'},{driverApplicationStatus:'rejected'}]) assert.equal(security.isApprovedDriver({...good,...mutation}),false);
-});
-test('fares fail closed for absent, malformed, negative or fractional-cent configuration', () => {
-  for (const raw of ['{}','invalid','{"pickup_only":-1}','{"pickup_only":1.001}','{"pickup_only":"25"}']) { process.env.SERVICE_PRICES_JSON=raw; assert.throws(() => security.quoteFare('pickup_only'),error => error.status===503); }
-  process.env.SERVICE_PRICES_JSON='{"pickup_only":25.5}'; assert.equal(security.quoteFare('pickup_only'),25.5);
 });
 test('offer redaction removes child, parent and handoff credentials without changing participant payload', () => {
   const ride={id:'ride',child:'child',parent:'parent',tripCode:'1234',safeWord:'secret',price:25};
@@ -49,8 +46,14 @@ test('unapproved drivers cannot list offers or accept rides', async () => {
 test('booking rejects a child belonging to a different account before database access', async () => {
   const res=response();await routes()['post /request']({user:{role:'parent',id:'parent',children:[{id:'own'}]},body:{childId:'other'}},res);assert.equal(res.code,403);
 });
-test('booking rejects a stale or missing quote rather than accepting client price', async () => {
-  process.env.SERVICE_PRICES_JSON='{"pickup_only":25}';for(const quotedPrice of [undefined,1,'25']) { const res=response();await routes()['post /request']({user:{role:'parent',id:'parent',children:[{id:'own'}]},body:{childId:'own',pickup:'A',dropoff:'B',price:1,quotedPrice}},res);assert.equal(res.code,409); }
+test('booking rejects a missing, forged or different-trip quote rather than accepting a client price', async () => {
+  const { quoteAllServices } = require('../lib/fareQuotes');
+  const a = { lat: 51.5, lng: -0.12 }, b = { lat: 51.52, lng: -0.1 };
+  const { quotes } = await quoteAllServices(pricing.normalizeSettings({}), 'parent', { pickupCoords: a, dropoffCoords: b, scheduledAt: null, stayMinutes: 60 });
+  const body = { childId: 'own', pickup: 'A', dropoff: 'B', pickupCoords: a, dropoffCoords: b, serviceType: 'pickup_only', price: 1 };
+  const cases = [{}, { quoteToken: 'forged' }, { quoteToken: quotes.dropoff_only.quoteToken }, { quoteToken: quotes.pickup_only.quoteToken, dropoffCoords: { lat: 51.6, lng: -0.1 } }];
+  for (const extra of cases) { const res=response();await routes()['post /request']({user:{role:'parent',id:'parent',children:[{id:'own'}]},body:{...body,...extra}},res);assert.equal(res.code,409); }
+  const res=response();await routes()['post /request']({user:{role:'parent',id:'someone-else',children:[{id:'own'}]},body:{...body,quoteToken:quotes.pickup_only.quoteToken}},res);assert.equal(res.code,409);
 });
 test('ride writes compare the expected status and assigned driver and report conflicts', async () => {
   const filters=[]; const query={update(){return this;},eq(k,v){filters.push([k,v]);return this;},select(){return this;},async maybeSingle(){return {data:null,error:null};}};
@@ -125,7 +128,7 @@ test('terminal status updates and cancellations clear the driver GPS fix and not
   const io={ to:(rooms)=>({ emit:(event)=>emitted.push([rooms,event]) }) };
   const handlers=routes({fetchRideRowById:async()=>({id:'ride',parent_id:'parent',driver_id:'driver',status:'child_picked_up'}),updateRideRow:async(_id,changes)=>{updates=changes;return {id:'ride',parent_id:'parent',driver_id:'driver',status:changes.status,price:1};}, formatRide:(r)=>r});
   let res=response();await handlers['put /:id/status']({params:{id:'ride'},body:{status:'completed'},user:{id:'driver',role:'driver',isVerifiedDriver:true,driverApplicationStatus:'approved'},app:{get:()=>io}},res);
-  assert.equal(res.code,200); assert.equal(updates.driver_location,null); assert.equal(JSON.stringify(emitted.at(-1)[0]),JSON.stringify(['parent','driver']));
+  assert.equal(res.code,200); assert.equal(updates.driver_location,null); assert.deepEqual(emitted.map(([room])=>room),['parent','driver'],'each side gets its own view');
   const cancel=routes({fetchRideRowById:async()=>({id:'ride',parent_id:'parent',driver_id:'driver',status:'driver_assigned'}),updateRideRow:async(_id,changes)=>{updates=changes;return {id:'ride',parent_id:'parent',driver_id:'driver',status:'cancelled',price:1};}, formatRide:(r)=>r});
   res=response();await cancel['put /:id/cancel']({params:{id:'ride'},user:{id:'parent',role:'parent'},app:{get:()=>null}},res);
   assert.equal(res.code,200); assert.equal(updates.driver_location,null);
@@ -376,7 +379,7 @@ test('admin live map lists online drivers as free or on a ride, with rides in pr
   res = response(); await handlers['/']({ user: { role: 'admin' } }, res);
   assert.equal(res.code, 200);
   assert.deepEqual(res.body.drivers.map((d) => `${d.name}:${d.status}`), ['Ada:on_ride', 'Ben:free']);
-  assert.deepEqual({ ...res.body.counts }, { online: 2, onRide: 1, ridesInProgress: 1, searching: 1 });
+  assert.deepEqual({ ...res.body.counts }, { online: 2, onRide: 1, ridesInProgress: 1, searching: 1, alerts: 0 });
   assert.equal(res.body.rides.find((r) => r.id === 'r1').driverName, 'Ada');
 });
 const scheduling = require('../lib/scheduling');
@@ -444,13 +447,12 @@ test('a driver with an accepted ride for later still gets offers until it is nea
   assert.deepEqual((await loadDispatch(db).findNearbyDrivers(pickup)).map((d) => d.driverId), ['free']);
 });
 test('booking for later validates the time; held rides cannot be accepted; only held rides can be moved', async () => {
-  process.env.SERVICE_PRICES_JSON = '{"pickup_only":25}';
   const parentUser = { role: 'parent', id: 'parent', children: [{ id: 'own' }] };
   let res = response();
-  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', quotedPrice: 25, scheduled: true, pickupTime: slot(10 * MIN).toISOString() } }, res);
+  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', scheduled: true, pickupTime: slot(10 * MIN).toISOString() } }, res);
   assert.equal(res.code, 400); assert.match(res.body.message, /30 minutes/);
   res = response();
-  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', quotedPrice: 25, scheduled: true } }, res);
+  await routes()['post /request']({ user: parentUser, body: { childId: 'own', pickup: 'A', dropoff: 'B', scheduled: true } }, res);
   assert.equal(res.code, 400);
 
   const heldRide = { id: 'r', parent_id: 'parent', status: 'searching_driver', is_scheduled: true, dispatch_released_at: null, driver_id: null, pickup_time: at(3 * 60 * MIN), dispatch_state: 'open' };
@@ -514,4 +516,114 @@ test('nearby rides: waiting rides within 5 km of the driver, nearest first, neve
   res = response(); await handlers['/nearby-rides']({ user: driver, query: {} }, res);
   assert.deepEqual({ ...res.body.origin }, { lat: 51.5034, lng: -0.1276 });
   assert.equal(res.body.rides.length, 3);
+});
+
+// Ride safety routes.
+const approvedDriver = { id: 'driver', role: 'driver', isVerifiedDriver: true, driverApplicationStatus: 'approved' };
+const arrivedRide = (extra = {}) => ({ id: 'ride', parent_id: 'parent', driver_id: 'driver', status: 'driver_arrived_at_pickup', trip_code: '4821', trip_code_attempts: 0, price: 20, ...extra });
+// A rides table whose conditional updates apply only while the filters match.
+const ridesTable = (row) => {
+  let pending, filters;
+  const chain = {
+    update(changes) { pending = changes; filters = {}; return chain; },
+    eq(column, value) { filters[column] = value; return chain; },
+    select() { return chain; },
+    async maybeSingle() {
+      const matches = Object.entries(filters).every(([column, value]) => row[column] === value);
+      if (matches) Object.assign(row, pending);
+      return { data: matches ? { ...row } : null, error: null };
+    }
+  };
+  return { row, db: { from: () => chain } };
+};
+
+test('the driver must enter the matching trip code before the child gets in', async () => {
+  const incidents = [];
+  let saved;
+  const table = ridesTable(arrivedRide());
+  const handlers = routes(
+    { fetchRideRowById: async () => ({ ...table.row }), updateRideRow: async (_id, changes) => { saved = changes; return { ...table.row, ...changes }; }, formatRide: (r) => r },
+    table.db,
+    { '../lib/incidents': { recordIncident: async (ride, kind, info) => { incidents.push([kind, info.details]); return { incident: {}, ride }; } } }
+  );
+  const put = async (tripCode) => { const res = response(); await handlers['put /:id/status']({ params: { id: 'ride' }, body: { status: 'child_picked_up', tripCode }, user: approvedDriver, app: { get: () => null } }, res); return res; };
+
+  let res = await put(undefined);
+  assert.equal(res.code, 400, 'a missing code is not counted');
+  assert.equal(table.row.trip_code_attempts, 0);
+
+  res = await put('1111');
+  assert.equal(res.code, 422); assert.equal(res.body.attemptsLeft, 4); assert.match(res.body.message, /4 tries left/);
+  assert.equal(table.row.trip_code_attempts, 1);
+  assert.equal(JSON.stringify(incidents), JSON.stringify([['trip_code', { attempt: 1, maxAttempts: 5, locked: false }]]));
+  assert.equal(saved, undefined, 'status unchanged on a wrong code');
+
+  res = await put('4821');
+  assert.equal(res.code, 200);
+  assert.equal(saved.status, 'child_picked_up'); assert.ok(saved.trip_code_verified_at);
+});
+
+test('five wrong trip codes lock the pickup; admins can still move the ride on', async () => {
+  const incidents = [];
+  const table = ridesTable(arrivedRide({ trip_code_attempts: 4 }));
+  const handlers = routes(
+    { fetchRideRowById: async () => ({ ...table.row }), updateRideRow: async (_id, changes) => ({ ...table.row, ...changes }), formatRide: (r) => r },
+    table.db,
+    { '../lib/incidents': { recordIncident: async (ride, kind, info) => { incidents.push(info.details); return { incident: {}, ride }; } } }
+  );
+  const put = async (tripCode, user = approvedDriver) => { const res = response(); await handlers['put /:id/status']({ params: { id: 'ride' }, body: { status: 'child_picked_up', tripCode }, user, app: { get: () => null } }, res); return res; };
+  let res = await put('0000');
+  assert.equal(res.code, 423); assert.equal(res.body.locked, true);
+  assert.equal(incidents.at(-1).locked, true);
+  res = await put('4821');
+  assert.equal(res.code, 423, 'even the right code is refused once locked');
+  res = await put(undefined, { id: 'admin', role: 'admin' });
+  assert.equal(res.code, 200);
+});
+
+test('drivers never receive the trip code; parents and admins do', () => {
+  const repository = load('lib/repository.js', { '../config/supabase': { supabaseAdmin: {} }, '../lib/scheduling': { scheduleState: () => null } });
+  const row = { id: 'ride', parent_id: 'parent', driver_id: 'driver', status: 'driver_arrived_at_pickup', trip_code: '4821', safe_word: 'Maple-Echo-123', price: 20 };
+  assert.equal(repository.formatRideFor({ id: 'driver', role: 'driver' }, row).tripCode, '');
+  assert.equal(repository.formatRideFor({ id: 'driver', role: 'driver' }, row).safeWord, 'Maple-Echo-123');
+  assert.equal(repository.formatRideFor({ id: 'parent', role: 'parent' }, row).tripCode, '4821');
+  assert.equal(repository.formatRideFor({ id: 'admin', role: 'admin' }, row).tripCode, '4821');
+});
+
+test('SOS needs confirmation, a participant and an unfinished ride, and records who, when and where', async () => {
+  const recorded = [];
+  const ride = arrivedRide({ driver_location: { latitude: 40.7, longitude: -74 } });
+  const handlers = routes({ fetchRideRowById: async () => ride, formatRide: (r) => r }, {}, {
+    '../lib/incidents': { recordIncident: async (r, kind, info) => { recorded.push([kind, info]); return { incident: { kind }, ride: { ...r, safety_alert: kind } }; } }
+  });
+  const sos = async (user, body) => { const res = response(); await handlers['post /:id/sos']({ params: { id: 'ride' }, body, user, app: { get: () => null } }, res); return res; };
+
+  assert.equal((await sos({ id: 'parent', role: 'parent' }, {})).code, 400, 'no confirm, no SOS');
+  assert.equal((await sos({ id: 'stranger', role: 'parent' }, { confirm: true })).code, 403);
+  let res = await sos({ id: 'parent', role: 'parent' }, { confirm: true, location: { latitude: 40.75, longitude: -73.98 }, note: '  help  ' });
+  assert.equal(res.code, 201); assert.equal(res.body.ride.safety_alert, 'sos');
+  assert.deepEqual(JSON.parse(JSON.stringify(recorded[0][1])), { userId: 'parent', role: 'parent', location: { latitude: 40.75, longitude: -73.98, accuracy: null, source: 'parent' }, details: { note: 'help', where: '40.7500, -73.9800' } });
+  res = await sos(approvedDriver, { confirm: true });
+  assert.equal(recorded[1][1].role, 'driver'); assert.equal(recorded[1][1].location.source, 'driver_gps', 'falls back to the ride GPS fix');
+  ride.status = 'completed';
+  assert.equal((await sos({ id: 'parent', role: 'parent' }, { confirm: true })).code, 409);
+});
+
+test('no-show is refused before the wait window and charges the fee after it', async () => {
+  const notified = [];
+  let saved;
+  const ride = arrivedRide({ arrived_at: new Date(Date.now() - 5 * 60000).toISOString() });
+  const handlers = routes({ fetchRideRowById: async () => ride, updateRideRow: async (_id, changes) => { saved = changes; return { ...ride, ...changes }; }, formatRide: (r) => r }, {}, {
+    '../lib/notifications': { notifyRideEvent: async (_ride, event) => { notified.push(event); } }
+  });
+  const put = async () => { const res = response(); await handlers['put /:id/no-show']({ params: { id: 'ride' }, body: {}, user: approvedDriver, app: { get: () => null } }, res); return res; };
+  let res = await put();
+  assert.equal(res.code, 409); assert.ok(res.body.availableAt);
+  ride.arrived_at = new Date(Date.now() - 11 * 60000).toISOString();
+  res = await put();
+  assert.equal(res.code, 200);
+  assert.deepEqual({ status: saved.status, fee: saved.cancellation_fee, reason: saved.cancel_reason }, { status: 'cancelled', fee: 10, reason: 'no_show' });
+  assert.deepEqual(notified, ['no_show']);
+  const other = response(); await handlers['put /:id/no-show']({ params: { id: 'ride' }, body: {}, user: { ...approvedDriver, id: 'someone' }, app: { get: () => null } }, other);
+  assert.equal(other.code, 404);
 });
