@@ -5,6 +5,7 @@ const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimit
 const { supabaseAdmin, supabaseAuth } = require('../config/supabase');
 const { fetchUserById, upsertProfileRow } = require('../lib/repository');
 const { sendError } = require('../lib/http');
+const { TERMS_VERSION } = require('../lib/account');
 
 const router = express.Router();
 
@@ -112,6 +113,11 @@ router.post('/register', authLimiter, async (req, res) => {
     return res.status(400).json({ message: 'role must be parent or driver' });
   }
 
+  // Sign-up records agreement to the Terms of Service and Privacy Policy.
+  if (req.body.acceptTerms !== true) {
+    return res.status(400).json({ message: 'Please agree to the Terms of Service and Privacy Policy' });
+  }
+
   let createdUserId = null;
 
   try {
@@ -152,6 +158,15 @@ router.post('/register', authLimiter, async (req, res) => {
         email: normalizedEmail,
         role: normalizedRole
       }));
+      // Best-effort until the legal migration has run: never block a sign-up on it.
+      try {
+        const { error: termsError } = await supabaseAdmin.from('profiles')
+          .update({ terms_accepted_at: new Date().toISOString(), terms_version: TERMS_VERSION })
+          .eq('id', data.user.id);
+        if (termsError) throw termsError;
+      } catch (termsError) {
+        console.error('Could not record terms acceptance', termsError?.message);
+      }
 
       // With "Confirm email" switched off in Supabase the account is confirmed at
       // signup and a session comes back, so sign the user straight in.

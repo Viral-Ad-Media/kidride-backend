@@ -91,21 +91,27 @@ function authHandlers(supabaseAuth, repository = {}, supabaseAdmin = {}) {
 test('registration requires email confirmation and issues no token', async () => {
   let profile;
   const handlers=authHandlers({auth:{signUp:async()=>({data:{user:{id:'u1',identities:[{}]}},error:null})}},{upsertProfileRow:async row=>{profile=row;}});
-  const res=response();await handlers['/register']({body:{name:'Pat',email:'Pat@Example.test',password:'password',role:'parent'}},res);
+  const res=response();await handlers['/register']({body:{name:'Pat',email:'Pat@Example.test',password:'password',role:'parent',acceptTerms:true}},res);
   assert.equal(res.code,202);assert.equal(res.body.requiresEmailVerification,true);assert.equal(res.body.token,undefined);assert.equal(profile.email,'pat@example.test');
 });
 test('registration for an existing email looks identical and writes no profile', async () => {
   let wrote=false;
   const handlers=authHandlers({auth:{signUp:async()=>({data:{user:{id:'existing',identities:[]}},error:null})}},{upsertProfileRow:async()=>{wrote=true;}});
-  const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password'}},res);
+  const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password',acceptTerms:true}},res);
   assert.equal(res.code,202);assert.equal(wrote,false);
 });
 test('registration signs the user in when Supabase confirms the email at signup', async () => {
   let profile;
   const user={id:'u2',email:'pat@example.test',email_confirmed_at:'2026-01-01',identities:[{}],user_metadata:{name:'Pat',role:'parent'}};
   const handlers=authHandlers({auth:{signUp:async()=>({data:{user,session:{access_token:'s'}},error:null})}},{upsertProfileRow:async row=>{profile=row;},fetchUserById:async()=>profile&&{id:'u2',name:'Pat',email:profile.email,role:profile.role,tokenVersion:0}});
-  const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password',role:'parent'}},res);
+  const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password',role:'parent',acceptTerms:true}},res);
   assert.equal(res.code,201);assert.equal(res.body.token,'token');assert.equal(res.body.role,'parent');assert.equal(res.body.requiresEmailVerification,undefined);
+});
+test('registration is refused without agreeing to the terms', async () => {
+  let called=false;
+  const handlers=authHandlers({auth:{signUp:async()=>{called=true;return {data:{},error:null};}}});
+  const res=response();await handlers['/register']({body:{name:'Pat',email:'pat@example.test',password:'password',role:'parent'}},res);
+  assert.equal(res.code,400);assert.equal(called,false);
 });
 test('login is refused until the email is confirmed', async () => {
   for (const result of [{data:{user:null},error:{code:'email_not_confirmed'}},{data:{user:{id:'u1',email_confirmed_at:null}},error:null}]) {

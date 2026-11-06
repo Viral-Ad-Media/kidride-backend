@@ -29,6 +29,7 @@ try {
     message: 'Too many requests. Please try again later.', keyPrefix: 'global'
   }));
   router.use('/auth', require('./routes/authRoutes'));
+  router.use('/account', require('./routes/accountRoutes'));
   router.use('/users/me/trusted-contacts', require('./routes/trustedContactRoutes'));
   router.use('/users', require('./routes/adminUserRoutes'));
   router.use('/users', require('./routes/userRoutes'));
