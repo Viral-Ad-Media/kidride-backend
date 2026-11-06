@@ -18,7 +18,7 @@ function routes(repository = {}, database = {}, extra = {}) {
   const handlers = {};
   repository = { formatRideFor: (_user, ride) => (repository.formatRide ? repository.formatRide(ride) : ride), ...repository };
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
-  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/notifications': { notifyRideEvent: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/pricingSettings': { loadPricing: async () => pricing.normalizeSettings({}) }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] }, '../lib/safetySettings': { loadSafety: async () => require('../lib/safety').normalizeSafety({}) }, '../lib/incidents': { recordIncident: async (ride) => ({ incident: {}, ride }), listIncidents: async () => [], resolveIncidents: async () => null }, ...extra });
+  load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/notifications': { notifyRideEvent: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500 }, '../lib/pricingSettings': { loadPricing: async () => pricing.normalizeSettings({}) }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] }, '../lib/safetySettings': { loadSafety: async () => require('../lib/safety').normalizeSafety({}) }, '../lib/incidents': { recordIncident: async (ride) => ({ incident: {}, ride }), listIncidents: async () => [], resolveIncidents: async () => null }, '../lib/sosAlerts': { emailTrustedContacts: async () => ({ count: 0, sending: Promise.resolve() }) }, ...extra });
   return handlers;
 }
 test('approval requires role, verification and approved status together', () => {
@@ -602,7 +602,14 @@ test('SOS needs confirmation, a participant and an unfinished ride, and records 
   assert.equal((await sos({ id: 'stranger', role: 'parent' }, { confirm: true })).code, 403);
   let res = await sos({ id: 'parent', role: 'parent' }, { confirm: true, location: { latitude: 40.75, longitude: -73.98 }, note: '  help  ' });
   assert.equal(res.code, 201); assert.equal(res.body.ride.safety_alert, 'sos');
-  assert.deepEqual(JSON.parse(JSON.stringify(recorded[0][1])), { userId: 'parent', role: 'parent', location: { latitude: 40.75, longitude: -73.98, accuracy: null, source: 'parent' }, details: { note: 'help', where: '40.7500, -73.9800' } });
+  const { columns, notify, ...info } = JSON.parse(JSON.stringify(recorded[0][1]));
+  assert.deepEqual(info, { userId: 'parent', role: 'parent', location: { latitude: 40.75, longitude: -73.98, accuracy: null, source: 'parent' }, details: { note: 'help', where: '40.7500, -73.9800' } });
+  // The live link carries a token; only its hash is stored, and it expires.
+  const token = res.body.liveUrl.split('/#/sos/')[1];
+  assert.match(token, /^[A-Za-z0-9_-]{32}$/);
+  assert.equal(columns.share_token_hash, require('crypto').createHash('sha256').update(token).digest('hex'));
+  assert.ok(new Date(columns.share_expires_at) > new Date());
+  assert.equal(notify.liveUrl, res.body.liveUrl); assert.equal(columns.contacts_notified, 0);
   res = await sos(approvedDriver, { confirm: true });
   assert.equal(recorded[1][1].role, 'driver'); assert.equal(recorded[1][1].location.source, 'driver_gps', 'falls back to the ride GPS fix');
   ride.status = 'completed';

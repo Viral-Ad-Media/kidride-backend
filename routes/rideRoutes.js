@@ -24,6 +24,9 @@ const { timingSafeEqual } = require('node:crypto');
 const { loadSafety } = require('../lib/safetySettings');
 const { DEFAULT_SAFETY, normalizeSafety, tripCodeMatches, evaluatePosition, noShowTerms } = require('../lib/safety');
 const { recordIncident, listIncidents, resolveIncidents } = require('../lib/incidents');
+const { makeShareToken } = require('../lib/sosShare');
+const { emailTrustedContacts } = require('../lib/sosAlerts');
+const { FRONTEND_URL, EMAIL_STAYS_IN_REQUEST } = require('../lib/notifications');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
@@ -747,14 +750,22 @@ router.post('/:id/sos', protect, sosLimiter, async (req, res) => {
       ? { latitude: sent.latitude, longitude: sent.longitude, accuracy: sent.accuracy ?? null, source: role }
       : ride.driver_location ? { ...ride.driver_location, source: 'driver_gps' } : null;
     const note = typeof req.body.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+    // A private live-location link for support, the parent and trusted contacts.
+    const share = makeShareToken();
+    const liveUrl = `${FRONTEND_URL}/#/sos/${share.token}`;
+    const contacts = await emailTrustedContacts({ ride, liveUrl, reporterRole: role })
+      .catch((error) => { console.warn('SOS contacts skipped', error?.message || error); return { count: 0, sending: Promise.resolve() }; });
     const { incident, ride: updated } = await recordIncident(ride, 'sos', {
       userId: req.user.id,
       role,
       location,
-      details: { ...(note ? { note } : {}), ...(location ? { where: `${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)}` } : {}) }
+      details: { ...(note ? { note } : {}), ...(location ? { where: `${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)}` } : {}) },
+      columns: { share_token_hash: share.hash, share_expires_at: share.expiresAt, contacts_notified: contacts.count },
+      notify: { liveUrl, contactsNotified: contacts.count }
     });
+    if (EMAIL_STAYS_IN_REQUEST) await contacts.sending;
     emitRideUpdate(req, updated, 'ride_safety_alert');
-    return res.status(201).json({ incident, ride: formatRideFor(req.user, updated) });
+    return res.status(201).json({ incident, ride: formatRideFor(req.user, updated), liveUrl, contactsNotified: contacts.count });
   } catch (error) {
     return sendError(res, error, 'Could not send the SOS. Call 911 if anyone is in danger.');
   }
