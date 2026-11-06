@@ -49,6 +49,7 @@ try {
   router.use('/admin/pricing', require('./routes/adminPricingRoutes'));
   router.use('/admin/safety', require('./routes/adminSafetyRoutes'));
   router.use('/rides', require('./routes/rideRoutes'));
+  router.use('/ride-series', require('./routes/seriesRoutes'));
   router.use('/safety-chat', require('./routes/safetyRoutes'));
   router.use('/notification-receipts', require('./routes/receiptRoutes'));
   router.use('/notifications', require('./routes/notificationRoutes'));
