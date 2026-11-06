@@ -31,6 +31,8 @@ The local server defaults to port 5000. Configure the environment before startin
 | `CRON_SECRET` | Private bearer secret for scheduled receipt processing |
 | `UPLOAD_RATE_LIMIT_WINDOW_MS`, `UPLOAD_RATE_LIMIT_MAX_REQUESTS` | Signed verification-upload URLs per driver account (default 30 per hour) |
 | `EMAIL_REDIRECT_URL` | Optional page the signup confirmation link returns to (must be in Supabase Auth redirect URLs) |
+| `SENTRY_DSN` | Optional Sentry project DSN for server error monitoring; unset = off. No request bodies, headers or IPs are sent |
+| `SENTRY_ENVIRONMENT` | Optional Sentry environment name (defaults to the Vercel environment) |
 | `PORT` | Local listener port, default 5000 |
 
 Supported fare keys: `pickup_only`, `dropoff_only`, `pickup_and_dropoff`, `stay_with_child_and_dropoff`. Values must be positive numbers with at most two decimal places. Missing/malformed pricing returns 503 for that service; no default free ride is created. This is fixed-service pricing, not distance-based fare calculation, payment collection, or payouts.
@@ -38,6 +40,13 @@ Supported fare keys: `pickup_only`, `dropoff_only`, `pickup_and_dropoff`, `stay_
 Optional throttle controls: `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS` (default 1000 per 15 minutes), `AUTH_RATE_LIMIT_WINDOW_MS`, `AUTH_RATE_LIMIT_MAX_ATTEMPTS` (20 per 15 minutes), `RIDE_REQUEST_RATE_LIMIT_WINDOW_MS`, and `RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS` (10 per minute). IPs come from Express's configured trusted-proxy chain, not arbitrary forwarded header values. Production counters are shared through a database RPC and fail closed if unavailable.
 
 Never put service-role, JWT, Gemini, cron, or Expo server secrets in client bundles. Revoke any Gemini key previously embedded in the web frontend.
+
+## Health and logs
+
+- `GET /health`: process is alive. `GET /api/health`: configuration loaded (503 if required variables are missing).
+- `GET /api/health/ready`: one cached database read (at most every 30 s); point an uptime monitor here.
+- Every response has an `X-Request-Id`; failed (4xx/5xx) or slow (over 2 s) API calls log one JSON line with that id. 500 responses include `requestId` so a user report can be matched to the log.
+- On start the server logs `[config]` warnings for missing or weak production settings (names only, never values).
 
 ## Database setup and deployment order
 
