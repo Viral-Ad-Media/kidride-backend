@@ -10,7 +10,7 @@ const protect = async (req, res, next) => {
 
   let decoded;
   try {
-    decoded = jwt.verify(req.headers.authorization.split(' ')[1], process.env.JWT_SECRET);
+    decoded = jwt.verify(req.headers.authorization.split(' ')[1], process.env.JWT_SECRET, { algorithms: ['HS256'] });
   } catch {
     return res.status(401).json({ message: 'Not authorized, token failed' });
   }

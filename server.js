@@ -14,7 +14,20 @@ app.use(cors({
     ? callback(null, true) : callback(new Error('Not allowed by CORS')),
   credentials: true
 }));
-app.use(express.json());
+app.disable('x-powered-by');
+// Baseline security headers for a JSON-only API.
+app.use((_req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+    'Cross-Origin-Resource-Policy': 'same-site',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
+  });
+  next();
+});
+app.use(express.json({ limit: '100kb' }));
 // Express 5 leaves req.body undefined when no JSON body was parsed.
 app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next(); });
 
@@ -80,7 +93,7 @@ if (require.main === module && !process.env.VERCEL) {
     app.set('io', io);
     io.use(async (socket, next) => {
       try {
-        const decoded = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(socket.handshake.auth?.token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
         const user = await fetchUserById(decoded.id);
         if (!user || (Number(decoded.tv) || 0) !== user.tokenVersion) throw new Error('Unknown account');
         socket.data.user = user;
