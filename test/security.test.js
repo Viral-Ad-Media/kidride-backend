@@ -28,7 +28,8 @@ test('approval requires role, verification and approved status together', () => 
 });
 test('offer redaction removes child, parent and handoff credentials without changing participant payload', () => {
   const ride={id:'ride',child:'child',parent:'parent',tripCode:'1234',safeWord:'secret',price:25};
-  assert.deepEqual(security.redactOffer(ride),{id:'ride',price:25}); assert.equal(ride.tripCode,'1234');
+  assert.deepEqual(security.redactOffer(ride),{id:'ride',price:25,childCount:1}); assert.equal(ride.tripCode,'1234');
+  assert.deepEqual(security.redactOffer({id:'ride',childIds:['a','b'],children:[{id:'a',name:'Ava'},{id:'b',name:'Leo'}]}),{id:'ride',childCount:2});
 });
 test('GPS rejects strings, nonfinite numbers and out-of-range coordinates', () => {
   assert.equal(security.validateCoordinates({latitude:90,longitude:-180,accuracy:0}),true);
@@ -54,6 +55,26 @@ test('booking rejects a missing, forged or different-trip quote rather than acce
   const cases = [{}, { quoteToken: 'forged' }, { quoteToken: quotes.dropoff_only.quoteToken }, { quoteToken: quotes.pickup_only.quoteToken, dropoffCoords: { lat: 51.6, lng: -0.1 } }];
   for (const extra of cases) { const res=response();await routes()['post /request']({user:{role:'parent',id:'parent',children:[{id:'own'}]},body:{...body,...extra}},res);assert.equal(res.code,409); }
   const res=response();await routes()['post /request']({user:{role:'parent',id:'someone-else',children:[{id:'own'}]},body:{...body,quoteToken:quotes.pickup_only.quoteToken}},res);assert.equal(res.code,409);
+});
+test('several children: own children only, no repeats, at most four, and the quote must be for the same number', async () => {
+  const { quoteAllServices } = require('../lib/fareQuotes');
+  const a = { lat: 51.5, lng: -0.12 }, b = { lat: 51.52, lng: -0.1 };
+  const settings = pricing.normalizeSettings({});
+  const one = await quoteAllServices(settings, 'parent', { pickupCoords: a, dropoffCoords: b, scheduledAt: null, stayMinutes: 60 });
+  const three = await quoteAllServices(settings, 'parent', { pickupCoords: a, dropoffCoords: b, scheduledAt: null, stayMinutes: 60, childCount: 3 });
+  const extra = three.quotes.pickup_only.lines.find((line) => line.key === 'extra_children');
+  assert.equal(extra.amount, 2 * settings.extraChildFee);
+  assert.equal(three.quotes.pickup_only.total, pricing.round2(one.quotes.pickup_only.total + 2 * settings.extraChildFee));
+  assert.equal(one.quotes.pickup_only.lines.some((line) => line.key === 'extra_children'), false);
+  const user = { role: 'parent', id: 'parent', children: [{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }, { id: 'c4' }, { id: 'c5' }] };
+  const body = { pickup: 'A', dropoff: 'B', pickupCoords: a, dropoffCoords: b, serviceType: 'pickup_only' };
+  const send = async (extraBody) => { const res = response(); await routes()['post /request']({ user, body: { ...body, ...extraBody } }, res); return res.code; };
+  assert.equal(await send({ childIds: ['c1', 'other'], quoteToken: three.quotes.pickup_only.quoteToken }), 403);
+  assert.equal(await send({ childIds: ['c1', 'c1'], quoteToken: one.quotes.pickup_only.quoteToken }), 400);
+  assert.equal(await send({ childIds: ['c1', 'c2', 'c3', 'c4', 'c5'], quoteToken: one.quotes.pickup_only.quoteToken }), 400);
+  // A one-child quote cannot book three children, and a three-child quote cannot book one.
+  assert.equal(await send({ childIds: ['c1', 'c2', 'c3'], quoteToken: one.quotes.pickup_only.quoteToken }), 409);
+  assert.equal(await send({ childIds: ['c1'], quoteToken: three.quotes.pickup_only.quoteToken }), 409);
 });
 test('ride writes compare the expected status and assigned driver and report conflicts', async () => {
   const filters=[]; const query={update(){return this;},eq(k,v){filters.push([k,v]);return this;},select(){return this;},async maybeSingle(){return {data:null,error:null};}};
@@ -234,7 +255,7 @@ function childRoutes(db) {
 }
 test('parents can edit and remove only their own children; children with ride history are archived', async () => {
   let removed = false, archived = false, activeRide = false, history = false;
-  const ridesQuery = () => { let active = false; const q = { eq: () => q, not: () => { active = true; return q; }, limit: async () => ({ data: (active ? activeRide : history) ? [{ id: 'r1' }] : [], error: null }) }; return q; };
+  const ridesQuery = () => { let active = false; const q = { eq: () => q, contains: () => q, not: () => { active = true; return q; }, limit: async () => ({ data: (active ? activeRide : history) ? [{ id: 'r1' }] : [], error: null }) }; return q; };
   const done = (fn) => { const q = { eq: () => q, then: (r) => { fn(); r({ error: null }); } }; return q; };
   const db = { from: (table) => ({
     select: () => table === 'children' ? { eq: () => ({ maybeSingle: async () => ({ data: { id: 'c1', parent_id: 'p1', archived_at: null }, error: null }) }) } : ridesQuery(),
