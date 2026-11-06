@@ -16,6 +16,17 @@ const { validateCoordinates } = require('../lib/security');
 const { saveDriverLocation } = require('../lib/dispatch');
 const router = express.Router();
 
+// Free-text limits. Photo links must be https so a profile cannot point
+// other users' browsers at javascript:, data: or plain-http addresses.
+const LIMITS = { name: 80, phone: 32, notes: 500, url: 500 };
+const isSafePhotoUrl = (value) => {
+  if (value === '') return true;
+  if (value.length > LIMITS.url) return false;
+  try { return new URL(value).protocol === 'https:'; } catch { return false; }
+};
+const isValidPhone = (value) => value === '' || (value.length <= LIMITS.phone && /^[+0-9 ()./-]+$/.test(value));
+const isValidChildAge = (age) => Number.isInteger(age) && age >= 1 && age <= 18;
+
 const formatUser = (user) => ({
   id: user.id,
   _id: user.id,
@@ -45,12 +56,15 @@ router.put('/profile', protect, async (req, res) => {
     const { name, phone, photoUrl, notifyEmail } = req.body;
 
     if (typeof name === 'string') {
+      if (!name.trim() || name.trim().length > LIMITS.name) return res.status(400).json({ message: `Name must be 1 to ${LIMITS.name} characters` });
       updates.name = name.trim();
     }
     if (typeof phone === 'string') {
+      if (!isValidPhone(phone.trim())) return res.status(400).json({ message: 'Enter a valid phone number' });
       updates.phone = phone.trim();
     }
     if (typeof photoUrl === 'string') {
+      if (!isSafePhotoUrl(photoUrl.trim())) return res.status(400).json({ message: 'Photo link must be an https address' });
       updates.photo_url = photoUrl.trim();
     }
     if (typeof notifyEmail === 'boolean') {
@@ -80,8 +94,11 @@ router.post('/children', protect, async (req, res) => {
     const { name, age, notes, photoUrl } = req.body;
     const normalizedAge = Number(age);
 
-    if (!name || !Number.isFinite(normalizedAge) || normalizedAge <= 0) {
-      return res.status(400).json({ message: 'Valid child name and age are required' });
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > LIMITS.name || !isValidChildAge(normalizedAge)) {
+      return res.status(400).json({ message: 'Valid child name and age (1 to 18) are required' });
+    }
+    if ((typeof notes === 'string' && notes.length > LIMITS.notes) || (typeof photoUrl === 'string' && !isSafePhotoUrl(photoUrl.trim()))) {
+      return res.status(400).json({ message: 'Notes are too long or the photo link is not https' });
     }
 
     const createdChild = await insertChildRow({
@@ -119,8 +136,8 @@ router.put('/children/:id', protect, async (req, res) => {
     if (!child) return undefined;
     const { name, age, notes } = req.body;
     const normalizedAge = Number(age);
-    if (typeof name !== 'string' || !name.trim() || !Number.isFinite(normalizedAge) || normalizedAge <= 0) {
-      return res.status(400).json({ message: 'Valid child name and age are required' });
+    if (typeof name !== 'string' || !name.trim() || name.trim().length > LIMITS.name || !isValidChildAge(normalizedAge) || (typeof notes === 'string' && notes.length > LIMITS.notes)) {
+      return res.status(400).json({ message: 'Valid child name and age (1 to 18) are required' });
     }
     const { error } = await supabaseAdmin.from('children').update({
       name: name.trim(),
@@ -201,10 +218,12 @@ router.post('/driver-application', protect, async (req, res) => {
       ? vehicle
       : { make, model, year, color, plate };
 
-    if (typeof phone !== 'string' || !phone.trim() || !['make', 'model', 'year', 'color', 'plate'].every(key => typeof incomingVehicle[key] === 'string' && incomingVehicle[key].trim())) return res.status(400).json({ message: 'Phone and complete vehicle details required' });
+    if (typeof phone !== 'string' || !phone.trim() || !isValidPhone(phone.trim()) || !['make', 'model', 'year', 'color', 'plate'].every(key => typeof incomingVehicle[key] === 'string' && incomingVehicle[key].trim() && incomingVehicle[key].length <= 60)) return res.status(400).json({ message: 'Phone and complete vehicle details required' });
+    // Store only the five vehicle fields, never extra keys from the request.
+    const cleanVehicle = Object.fromEntries(['make', 'model', 'year', 'color', 'plate'].map((key) => [key, incomingVehicle[key].trim()]));
     const { error: submissionError } = await supabaseAdmin.rpc('submit_driver_application', {
       applicant_id: req.user.id, application_documents: req.body.documents,
-      applicant_phone: phone.trim(), applicant_vehicle: incomingVehicle
+      applicant_phone: phone.trim(), applicant_vehicle: cleanVehicle
     });
     if (submissionError) throw submissionError;
     await removeUnusedUploads(req.user.id, req.body.documents);

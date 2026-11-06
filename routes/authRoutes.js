@@ -25,7 +25,7 @@ const VERIFICATION_REQUIRED_RESPONSE = {
 const normalizeEmail = (value = '') => value.trim().toLowerCase();
 
 // `tv` ties the token to profiles.token_version; bumping it revokes the token.
-const generateToken = (user) => jwt.sign({ id: user.id, tv: user.tokenVersion || 0 }, process.env.JWT_SECRET, { expiresIn: '30d' });
+const generateToken = (user) => jwt.sign({ id: user.id, tv: user.tokenVersion || 0 }, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: '30d' });
 
 const formatAuthUser = (user, token) => {
   const payload = {
@@ -108,6 +108,13 @@ router.post('/register', authLimiter, async (req, res) => {
     return res.status(400).json({ message: 'name, email, and password are required' });
   }
 
+  if (typeof password !== 'string' || password.length < 8 || password.length > 72) {
+    return res.status(400).json({ message: 'Password must be 8 to 72 characters' });
+  }
+  if (normalizedName.length > 80 || normalizedEmail.length > 254) {
+    return res.status(400).json({ message: 'Name or email is too long' });
+  }
+
   if (!VALID_ROLES.has(normalizedRole)) {
     return res.status(400).json({ message: 'role must be parent or driver' });
   }
@@ -174,7 +181,7 @@ router.post('/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   const normalizedEmail = typeof email === 'string' ? normalizeEmail(email) : '';
 
-  if (!normalizedEmail || !password) {
+  if (!normalizedEmail || typeof password !== 'string' || !password) {
     return res.status(400).json({ message: 'email and password are required' });
   }
 
