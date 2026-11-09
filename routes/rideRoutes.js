@@ -14,7 +14,8 @@ const {
 const { isApprovedDriver, ACTIVE_STATUSES, redactOffer, generateTripCode, generateSafeWord, validateCoordinates, parsePlaceCoords } = require('../lib/security');
 const { notifyRideEvent } = require('../lib/notifications');
 const { sendError } = require('../lib/http');
-const { MAX_COMMENT_LENGTH } = require('../lib/ratings');
+const { fetchRatingSummaries, fetchFamilyRatingSummaries } = require('../lib/ratings');
+const { DRIVER_TAGS, FAMILY_TAGS, tagLabel, parseRating, ratingWindowOpen, needsReview } = require('../lib/ratingRules');
 const dispatch = require('../lib/dispatch');
 const scheduling = require('../lib/scheduling');
 const { loadPricing } = require('../lib/pricingSettings');
@@ -344,12 +345,17 @@ router.get('/', protect, async (req, res) => {
 
     const rides = await fetchRideRows(query);
     const formatted = rides.map((ride) => formatRideFor(req.user, ride));
-    // Parents see which of their rides they have already rated.
-    if (req.user.role === 'parent' && formatted.length) {
-      const { data: ratings, error: ratingError } = await supabaseAdmin.from('ride_ratings').select('ride_id, stars, comment').in('ride_id', formatted.map((ride) => ride.id));
+    // Each side sees which of their rides they have already rated (parents rate
+    // drivers in ride_ratings, drivers rate families in family_ratings).
+    if (['parent', 'driver'].includes(req.user.role) && formatted.length) {
+      const table = req.user.role === 'parent' ? 'ride_ratings' : 'family_ratings';
+      const { data: ratings, error: ratingError } = await supabaseAdmin.from(table).select('ride_id, stars, tags, comment').in('ride_id', formatted.map((ride) => ride.id));
       if (ratingError) throw ratingError;
-      const byRide = new Map((ratings || []).map((row) => [row.ride_id, { stars: row.stars, comment: row.comment || null }]));
-      for (const ride of formatted) ride.rating = byRide.get(ride.id) || null;
+      const byRide = new Map((ratings || []).map((row) => [row.ride_id, { stars: row.stars, tags: row.tags || [], comment: row.comment || null }]));
+      for (const ride of formatted) {
+        ride.rating = byRide.get(ride.id) || null;
+        ride.canRate = !ride.rating && ride.status === 'completed' && ratingWindowOpen(rides.find((row) => row.id === ride.id));
+      }
     }
     return res.json(formatted);
   } catch (error) {
@@ -831,25 +837,69 @@ router.put('/:id/no-show', protect, async (req, res) => {
   } catch (error) { return sendError(res, error); }
 });
 
-// The parent rates the driver of their completed ride once: 1-5 stars and an optional comment.
+// The parent rates the driver of their completed ride once: 1-5 stars, tags and an
+// optional comment, within RATING_WINDOW_DAYS of drop-off. Compliments are passed on
+// to the driver; low ratings, and drivers whose rolling average drops under the
+// review line, are flagged to admins.
 router.post('/:id/rating', protect, async (req, res) => {
-  const stars = Number(req.body.stars);
-  if (!Number.isInteger(stars) || stars < 1 || stars > 5) return res.status(400).json({ message: 'Choose between 1 and 5 stars' });
-  const comment = typeof req.body.comment === 'string' ? req.body.comment.trim() : '';
-  if (comment.length > MAX_COMMENT_LENGTH) return res.status(400).json({ message: `Keep the review under ${MAX_COMMENT_LENGTH} characters` });
+  const parsed = parseRating(req.body, DRIVER_TAGS);
+  if (parsed.error) return res.status(400).json({ message: parsed.error });
   try {
     const ride = await fetchRideRowById(req.params.id);
     if (!ride) return res.status(404).json({ message: 'Ride not found' });
     if (req.user.role !== 'parent' || ride.parent_id !== req.user.id) return res.status(403).json({ message: 'Only the parent who booked this ride can rate it' });
     if (ride.status !== 'completed' || !ride.driver_id) return res.status(409).json({ message: 'Only completed rides can be rated' });
+    if (!ratingWindowOpen(ride)) return res.status(409).json({ message: 'This ride is too old to rate' });
     const { data, error } = await supabaseAdmin.from('ride_ratings')
-      .insert({ ride_id: ride.id, parent_id: req.user.id, driver_id: ride.driver_id, stars, comment: comment || null })
-      .select('stars, comment, created_at').single();
+      .insert({ ride_id: ride.id, parent_id: req.user.id, driver_id: ride.driver_id, stars: parsed.stars, tags: parsed.tags, comment: parsed.comment })
+      .select('stars, tags, comment, created_at').single();
     if (error?.code === '23505') return res.status(409).json({ message: 'You have already rated this ride' });
     if (error) throw error;
-    return res.status(201).json({ rideId: ride.id, stars: data.stars, comment: data.comment || null, createdAt: data.created_at });
+    await safely(async () => {
+      const labels = parsed.tags.map((tag) => tagLabel(DRIVER_TAGS, tag));
+      if (parsed.stars >= 4 && labels.length) await notifyRideEvent(ride, 'compliment', { stars: parsed.stars, labels });
+      const summary = (await fetchRatingSummaries([ride.driver_id])).get(ride.driver_id);
+      const review = needsReview(summary);
+      if (parsed.stars <= 2 || review) await notifyRideEvent(ride, 'rating_low', { stars: parsed.stars, labels, average: summary.average, count: summary.count, review });
+    }, 'Rating follow-up failed');
+    return res.status(201).json({ rideId: ride.id, stars: data.stars, tags: data.tags || [], comment: data.comment || null, createdAt: data.created_at });
   } catch (error) {
     return sendError(res, error, 'Unable to save your rating');
+  }
+});
+
+// The driver rates the family of their completed ride once (Uber-style two-way rating).
+router.post('/:id/family-rating', protect, async (req, res) => {
+  const parsed = parseRating(req.body, FAMILY_TAGS);
+  if (parsed.error) return res.status(400).json({ message: parsed.error });
+  try {
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride) return res.status(404).json({ message: 'Ride not found' });
+    if (req.user.role !== 'driver' || ride.driver_id !== req.user.id) return res.status(403).json({ message: 'Only the driver of this ride can rate the family' });
+    if (ride.status !== 'completed') return res.status(409).json({ message: 'Only completed rides can be rated' });
+    if (!ratingWindowOpen(ride)) return res.status(409).json({ message: 'This ride is too old to rate' });
+    const { data, error } = await supabaseAdmin.from('family_ratings')
+      .insert({ ride_id: ride.id, driver_id: req.user.id, parent_id: ride.parent_id, stars: parsed.stars, tags: parsed.tags, comment: parsed.comment })
+      .select('stars, tags, comment, created_at').single();
+    if (error?.code === '23505') return res.status(409).json({ message: 'You have already rated this family' });
+    if (error) throw error;
+    return res.status(201).json({ rideId: ride.id, stars: data.stars, tags: data.tags || [], comment: data.comment || null, createdAt: data.created_at });
+  } catch (error) {
+    return sendError(res, error, 'Unable to save your rating');
+  }
+});
+
+// The family's rating, for the driver of the ride (before pickup, like Uber's rider
+// rating) and admins. Comments stay private.
+router.get('/:id/family-rating', protect, async (req, res) => {
+  try {
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride) return res.status(404).json({ message: 'Ride not found' });
+    if (req.user.role !== 'admin' && ride.driver_id !== req.user.id && ride.parent_id !== req.user.id) return res.status(403).json({ message: 'Not your ride' });
+    const summary = (await fetchFamilyRatingSummaries([ride.parent_id])).get(ride.parent_id);
+    return res.json({ parentId: ride.parent_id, average: summary.average, count: summary.count, compliments: summary.compliments });
+  } catch (error) {
+    return sendError(res, error, 'Unable to load ratings');
   }
 });
 
