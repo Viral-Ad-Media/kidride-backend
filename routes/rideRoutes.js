@@ -24,6 +24,7 @@ const { MAX_CHILDREN_PER_RIDE } = require('../lib/pricing');
 const { timingSafeEqual } = require('node:crypto');
 const { loadSafety } = require('../lib/safetySettings');
 const { DEFAULT_SAFETY, normalizeSafety, tripCodeMatches, evaluatePosition, noShowTerms } = require('../lib/safety');
+const { generateForParent, generateAll } = require('../lib/seriesGenerator');
 const { recordIncident, listIncidents, resolveIncidents } = require('../lib/incidents');
 
 // Dispatch failures must never break booking, offers or tracking.
@@ -174,7 +175,7 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
     if (!fare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
     if (normalized.scheduled) {
       const { count, error: countError } = await supabaseAdmin.from('rides').select('id', { count: 'exact', head: true })
-        .eq('parent_id', req.user.id).eq('is_scheduled', true).in('status', scheduling.NOT_STARTED_STATUSES);
+        .eq('parent_id', req.user.id).eq('is_scheduled', true).is('series_id', null).in('status', scheduling.NOT_STARTED_STATUSES);
       if (countError) throw countError;
       if (count >= scheduling.MAX_SCHEDULED_PER_PARENT) return res.status(409).json({ message: `You can have up to ${scheduling.MAX_SCHEDULED_PER_PARENT} upcoming rides. Cancel one to book another.` });
     }
@@ -361,9 +362,11 @@ router.get('/', protect, async (req, res) => {
 router.get('/scheduled', protect, async (req, res) => {
   try {
     if (req.user.role !== 'parent' && !isApprovedDriver(req.user)) return res.status(403).json({ message: 'Parent or approved driver account required' });
+    if (req.user.role === 'parent') await safely(() => generateForParent(req.user.id), 'Series generation failed');
     await safely(() => dispatch.releaseDueScheduledRides(), 'Scheduled release failed');
+    // Room for one-off rides plus a week of every repeating booking.
     let query = supabaseAdmin.from('rides').select(RIDE_SELECT).eq('is_scheduled', true)
-      .order('pickup_time', { ascending: true }).limit(scheduling.MAX_SCHEDULED_PER_PARENT * 2);
+      .order('pickup_time', { ascending: true }).limit(scheduling.MAX_SCHEDULED_PER_PARENT * 2 + 60);
     query = req.user.role === 'parent'
       ? query.eq('parent_id', req.user.id).in('status', scheduling.NOT_STARTED_STATUSES)
       : query.eq('driver_id', req.user.id).eq('status', 'driver_assigned');
@@ -381,12 +384,13 @@ router.get('/scheduled/dispatch', async (req, res) => {
   const actual = req.headers.authorization || '';
   if (!process.env.CRON_SECRET || actual.length !== expected.length || !timingSafeEqual(Buffer.from(actual), Buffer.from(expected))) return res.status(401).json({ message: 'Not authorized' });
   try {
+    const generated = await safely(() => generateAll(), 'Series generation failed');
     const released = await dispatch.releaseDueScheduledRides();
     const { data: targeted, error } = await supabaseAdmin.from('rides').select('id, status, driver_id, dispatch_state, pickup_coords')
       .eq('dispatch_state', 'targeted').in('status', OPEN_REQUEST_STATUSES).is('driver_id', null).limit(50);
     if (error) throw error;
     for (const ride of targeted || []) await dispatch.advanceDispatch(ride);
-    return res.json({ released, advanced: (targeted || []).length });
+    return res.json({ generated: generated || 0, released, advanced: (targeted || []).length });
   } catch (error) {
     return sendError(res, error, 'Scheduled dispatch failed');
   }

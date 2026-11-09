@@ -1,3 +1,11 @@
 {
-  "regions": ["dub1"]
+  "regions": [
+    "dub1"
+  ],
+  "crons": [
+    {
+      "path": "/api/rides/scheduled/dispatch",
+      "schedule": "0 4 * * *"
+    }
+  ]
 }
