@@ -62,6 +62,10 @@ router.put('/profile', protect, async (req, res) => {
     }
 
     await updateProfileRowById(req.user.id, updates);
+    // An approved driver changing their phone number must show their car and plate again.
+    if (req.user.role === 'driver' && req.user.driverApplicationStatus === 'approved' && typeof updates.phone === 'string' && updates.phone !== (req.user.phone || '')) {
+      try { await driverChecks.flag(req.user.id, 'details_changed', { details: { changed: 'phone' } }); } catch (error) { console.error('Re-verification flag failed', error); }
+    }
     const updatedUser = await fetchUserById(req.user.id);
     return res.json(formatUser(updatedUser));
   } catch (error) {
@@ -174,7 +178,8 @@ router.put('/me/presence', protect, async (req, res) => {
     if (online && req.user.driverApplicationStatus === 'approved') {
       let settings;
       try { settings = await loadSafety(); } catch { settings = normalizeSafety(DEFAULT_SAFETY); }
-      if (await driverChecks.gateOnline(req.user.id, settings)) {
+      const here = typeof req.body.latitude === 'number' && validateCoordinates({ latitude: req.body.latitude, longitude: req.body.longitude }) ? { latitude: req.body.latitude, longitude: req.body.longitude } : null;
+      if (await driverChecks.gateOnline(req.user.id, settings, { deviceId: req.body.deviceId, position: here })) {
         await supabaseAdmin.from('profiles').update({ last_online_at: null }).eq('id', req.user.id);
         return res.status(403).json({ message: 'Complete your verification checks to go online.', code: 'verification_required' });
       }
@@ -217,12 +222,21 @@ router.post('/driver-application', protect, async (req, res) => {
       : { make, model, year, color, plate };
 
     if (typeof phone !== 'string' || !phone.trim() || !['make', 'model', 'year', 'color', 'plate'].every(key => typeof incomingVehicle[key] === 'string' && incomingVehicle[key].trim())) return res.status(400).json({ message: 'Phone and complete vehicle details required' });
+    // Expiry dates (YYYY-MM-DD, in the future) so KidRide can ask for new photos before they lapse.
+    const futureDate = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && new Date(`${value}T23:59:59Z`) > new Date();
+    const { licenseExpiresOn, insuranceExpiresOn } = req.body;
+    if (!futureDate(licenseExpiresOn) || !futureDate(insuranceExpiresOn)) return res.status(400).json({ message: 'Enter the expiry dates of your licence and insurance' });
+    const wasApproved = req.user.driverApplicationStatus === 'approved';
+    const oldVehicle = req.user.vehicle || {};
+    const carChanged = wasApproved && ['make', 'model', 'color', 'plate'].some((key) => String(oldVehicle[key] || '').trim().toLowerCase() !== String(incomingVehicle[key] || '').trim().toLowerCase());
     const { error: submissionError } = await supabaseAdmin.rpc('submit_driver_application', {
       applicant_id: req.user.id, application_documents: req.body.documents,
       applicant_phone: phone.trim(), applicant_vehicle: incomingVehicle
     });
     if (submissionError) throw submissionError;
+    await supabaseAdmin.from('driver_applications').update({ license_expires_on: licenseExpiresOn, insurance_expires_on: insuranceExpiresOn }).eq('driver_id', req.user.id);
     await removeUnusedUploads(req.user.id, req.body.documents);
+    if (carChanged) { try { await driverChecks.flag(req.user.id, 'details_changed', { details: { changed: 'vehicle' } }); } catch (error) { console.error('Re-verification flag failed', error); } }
     // New applicants verify their identity and do a first face check (the reference for later checks).
     try { await driverChecks.flag(req.user.id, 'onboarding'); } catch (error) { console.error('Onboarding checks not created', error); }
 

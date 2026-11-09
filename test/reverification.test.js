@@ -1,7 +1,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const { planChecks, expandForProvider, pickActions, onlineReason, blocksDriving, RULES } = require('../lib/reverification');
+const { planChecks, expandForProvider, pickActions, onlineReasons, blocksDriving, platesMatch, expiringDocuments, RULES } = require('../lib/reverification');
+const { parseCheckrWebhook } = require('../lib/backgroundCheck');
 const { normalizeSafety } = require('../lib/safety');
 const { parseWebhook } = require('../lib/identityProvider');
 
@@ -28,14 +29,44 @@ test('liveness challenges pick three different random actions', () => {
   assert.equal(new Set(actions).size, 3);
 });
 
-test('going online: renewal, inactivity and spot checks', () => {
+test('going online: renewal, far away, new device, inactivity and spot checks', () => {
   const now = new Date('2026-11-09T12:00:00Z');
   const daysAgo = (d) => new Date(now - d * 86400000).toISOString();
-  assert.equal(onlineReason(settings, { identityVerifiedAt: daysAgo(400), lastOnlineAt: daysAgo(1) }, now, () => 0.99), 'identity_renewal');
-  assert.equal(onlineReason(settings, { identityVerifiedAt: daysAgo(10), lastOnlineAt: daysAgo(45) }, now, () => 0.99), 'inactivity');
-  assert.equal(onlineReason(settings, { lastOnlineAt: daysAgo(1) }, now, () => 0.01), 'spot_check');
-  assert.equal(onlineReason(settings, { lastOnlineAt: daysAgo(1), lastSpotCheckAt: daysAgo(2) }, now, () => 0.01), null, 'not twice in a week');
-  assert.equal(onlineReason(settings, { lastOnlineAt: daysAgo(1) }, now, () => 0.5), null);
+  assert.deepEqual(onlineReasons(settings, { identityVerifiedAt: daysAgo(400), lastOnlineAt: daysAgo(1) }, now, () => 0.99), ['identity_renewal']);
+  assert.deepEqual(onlineReasons(settings, { identityVerifiedAt: daysAgo(10), lastOnlineAt: daysAgo(45) }, now, () => 0.99), ['inactivity']);
+  assert.deepEqual(onlineReasons(settings, { lastOnlineAt: daysAgo(1), metersFromLastFix: 250000 }, now, () => 0.99), ['far_location']);
+  assert.deepEqual(onlineReasons(settings, { lastOnlineAt: daysAgo(1), metersFromLastFix: 5000 }, now, () => 0.99), []);
+  assert.deepEqual(onlineReasons(settings, { lastOnlineAt: daysAgo(1), deviceId: 'new-device-1', knownDevices: ['old-device-1'] }, now, () => 0.99), ['new_device']);
+  assert.deepEqual(onlineReasons(settings, { lastOnlineAt: daysAgo(1), deviceId: 'first-device', knownDevices: [] }, now, () => 0.99), [], 'the first device is learned, not flagged');
+  assert.deepEqual(onlineReasons(settings, { lastOnlineAt: daysAgo(1) }, now, () => 0.01), ['spot_check']);
+  assert.deepEqual(onlineReasons(settings, { lastOnlineAt: daysAgo(1), lastSpotCheckAt: daysAgo(2) }, now, () => 0.01), [], 'not twice in a week');
+});
+
+test('plates match ignoring spacing and case, with one misread character', () => {
+  assert.equal(platesMatch('kdr123', 'KDR 123'), true);
+  assert.equal(platesMatch('KDR-l23', 'KDR 123'), true);
+  assert.equal(platesMatch('KDR12', 'KDR 123'), true);
+  assert.equal(platesMatch('ABC999', 'KDR 123'), false);
+  assert.equal(platesMatch('', 'KDR 123'), false);
+});
+
+test('documents expiring within the reminder window', () => {
+  const now = new Date('2026-11-09T12:00:00Z');
+  assert.deepEqual(expiringDocuments({ license_expires_on: '2026-11-20', insurance_expires_on: '2027-05-01' }, 14, now), [{ kind: 'id_document', expiresOn: '2026-11-20' }]);
+  assert.deepEqual(expiringDocuments({ license_expires_on: null, insurance_expires_on: '2026-11-01' }, 14, now), [{ kind: 'insurance_document', expiresOn: '2026-11-01' }]);
+  assert.deepEqual(expiringDocuments(null, 14, now), []);
+});
+
+test('new drivers get a background check when one is switched on', () => {
+  assert.deepEqual(expandForProvider(planChecks('onboarding'), true, 'checkr', 'onboarding').checks, ['identity', 'liveness', 'background']);
+  assert.deepEqual(expandForProvider(planChecks('onboarding'), true, 'off', 'onboarding').checks, ['identity', 'liveness']);
+});
+
+test('Checkr webhooks are signed with the API key', () => {
+  const body = JSON.stringify({ type: 'report.completed', data: { object: { id: 'r1', candidate_id: 'c1', result: 'clear' } } });
+  const sig = crypto.createHmac('sha256', 'key').update(body).digest('hex');
+  assert.deepEqual(parseCheckrWebhook(body, sig, 'key'), { candidateId: 'c1', result: 'clear', reportId: 'r1' });
+  assert.throws(() => parseCheckrWebhook(body, 'bad', 'key'), /Bad signature/);
 });
 
 test('which checks stop new rides', () => {
@@ -44,6 +75,9 @@ test('which checks stop new rides', () => {
   assert.equal(blocksDriving({ status: 'submitted', clears: 'review' }), true);
   assert.equal(blocksDriving({ status: 'failed', clears: 'submit' }), true);
   assert.equal(blocksDriving({ status: 'passed', clears: 'review' }), false);
+  const now = new Date('2026-11-09T12:00:00Z');
+  assert.equal(blocksDriving({ status: 'pending', clears: 'review', due_at: '2026-11-20T23:59:59Z' }, now), false, 'expiring document: not yet');
+  assert.equal(blocksDriving({ status: 'pending', clears: 'review', due_at: '2026-11-01T23:59:59Z' }, now), true, 'expired document blocks');
 });
 
 test('identity webhooks need a valid recent Stripe signature', () => {

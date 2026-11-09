@@ -27,6 +27,7 @@ const { DEFAULT_SAFETY, normalizeSafety, tripCodeMatches, evaluatePosition, noSh
 const { generateForParent, generateAll } = require('../lib/seriesGenerator');
 const { recordIncident, listIncidents, resolveIncidents } = require('../lib/incidents');
 const driverChecks = require('../lib/driverChecks');
+const { trafficFactor } = require('../lib/routeMetrics');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
@@ -441,8 +442,13 @@ router.put('/:id/location', protect, async (req, res) => {
     const driver_location = { latitude: req.body.latitude, longitude: req.body.longitude, accuracy: req.body.accuracy ?? null, heading: req.body.heading ?? null, speed: req.body.speed ?? null, recordedAt: new Date().toISOString() };
     // With the child onboard, watch for the car leaving the route or stopping. Fixes
     // vaguer than 200 m are skipped so poor GPS does not raise false alarms.
+    const position = { lat: req.body.latitude, lng: req.body.longitude };
+    // Traffic on the way to the drop-off, measured once per trip, so stops in known congestion are allowed.
+    if (ride.status === 'child_picked_up' && ride.dropoff_coords && !(ride.monitor && 'trafficFactor' in ride.monitor)) {
+      ride.monitor = { ...(ride.monitor || {}), trafficFactor: (await safely(() => trafficFactor(position, ride.dropoff_coords), 'Traffic lookup failed')) || 1 };
+    }
     const watch = ride.status === 'child_picked_up' && !(req.body.accuracy > 200)
-      ? await safely(async () => evaluatePosition(await safetySettings(), ride, { lat: req.body.latitude, lng: req.body.longitude }), 'Route watch failed')
+      ? await safely(async () => evaluatePosition(await safetySettings(), ride, position), 'Route watch failed')
       : null;
     const updated = await updateRideRow(ride.id, { driver_location, ...(watch ? { monitor: watch.monitor } : {}) }, ride.status, req.user.id);
     for (const alert of watch?.alerts || []) {

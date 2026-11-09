@@ -4,6 +4,12 @@ const { sendError } = require('../lib/http');
 const { createRateLimiter } = require('../middleware/rateLimitMiddleware');
 const checks = require('../lib/driverChecks');
 const { RULES, CHECK_KINDS } = require('../lib/reverification');
+const { timingSafeEqual } = require('node:crypto');
+const { loadSafety } = require('../lib/safetySettings');
+const { normalizeSafety, DEFAULT_SAFETY } = require('../lib/safety');
+const backgroundCheck = require('../lib/backgroundCheck');
+
+const settings = async () => { try { return await loadSafety(); } catch { return normalizeSafety(DEFAULT_SAFETY); } };
 
 // Driver verification: identity (provider), face checks with random actions,
 // and live photos of the car, plate, licence or current location.
@@ -20,7 +26,7 @@ router.get('/', protect, requireDriver, async (req, res) => {
   try {
     const [identity, list] = await Promise.all([checks.identityState(req.user.id), checks.listForDriver(req.user.id)]);
     const { sessionId, ...publicIdentity } = identity;
-    return res.json({ identity: publicIdentity, checks: list, blocked: list.some((check) => check.blocksDriving) });
+    return res.json({ identity: publicIdentity, background: { mode: backgroundCheck.mode() }, checks: list, blocked: list.some((check) => check.blocksDriving) });
   } catch (error) { return fail(res, error, 'Unable to load verification'); }
 });
 
@@ -38,6 +44,20 @@ router.post('/identity/refresh', protect, requireDriver, async (req, res) => {
   catch (error) { return fail(res, error, 'Unable to check ID verification'); }
 });
 
+router.post('/background/start', protect, requireDriver, limiter, async (req, res) => {
+  try { return res.json(await checks.startBackground(req.user)); }
+  catch (error) { return fail(res, error, 'Unable to start the background check'); }
+});
+
+// Daily job (Vercel Cron, CRON_SECRET): licence and insurance expiry reminders.
+router.get('/cron/daily', async (req, res) => {
+  const expected = `Bearer ${process.env.CRON_SECRET || ''}`;
+  const actual = String(req.get('authorization') || '');
+  if (!process.env.CRON_SECRET || actual.length !== expected.length || !timingSafeEqual(Buffer.from(actual), Buffer.from(expected))) return res.status(401).json({ message: 'Not authorized' });
+  try { return res.json(await checks.runDaily(await settings())); }
+  catch (error) { return fail(res, error, 'Daily verification job failed'); }
+});
+
 router.post('/:id/start', protect, requireDriver, limiter, async (req, res) => {
   try { return res.json(await checks.startCheck(req.user.id, req.params.id)); }
   catch (error) { return fail(res, error, 'Unable to start the check'); }
@@ -49,7 +69,7 @@ router.post('/:id/upload-url', protect, requireDriver, limiter, async (req, res)
 });
 
 router.post('/:id/submit', protect, requireDriver, async (req, res) => {
-  try { return res.json(await checks.submitCheck(req.user.id, req.params.id, req.body)); }
+  try { return res.json(await checks.submitCheck(req.user.id, req.params.id, req.body, await settings())); }
   catch (error) { return fail(res, error, 'Unable to send the check'); }
 });
 

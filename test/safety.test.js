@@ -126,3 +126,18 @@ test('an impossible jump between fixes is flagged as a GPS jump', () => {
   const jumped = evaluatePosition(safety, onboard(monitor), { lat: pickup.lat + 0.2, lng: pickup.lng }, new Date(at(0).getTime() + 30000));
   assert.ok(jumped.alerts.some((a) => a.kind === 'gps_jump'));
 });
+
+test('heavy traffic on the route allows more stops before alerting', () => {
+  let monitor = { trafficFactor: 2 };
+  let fired = [];
+  for (let i = 0; i < 6; i++) {
+    const spot = { lat: 40.72 + i * 0.0036, lng: -74.002 };
+    let result = evaluatePosition(safety, onboard(monitor), spot, at(i * 4));
+    fired = fired.concat(result.alerts.map((a) => a.kind));
+    result = evaluatePosition(safety, onboard(result.monitor), spot, at(i * 4 + 3));
+    fired = fired.concat(result.alerts.map((a) => a.kind));
+    monitor = result.monitor;
+  }
+  assert.equal(monitor.stops, 5);
+  assert.deepEqual(fired.filter((k) => k === 'frequent_stops'), [], 'limit doubles to 8 in heavy traffic');
+});

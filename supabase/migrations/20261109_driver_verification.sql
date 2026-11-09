@@ -10,6 +10,17 @@ alter table public.profiles add column if not exists identity_error jsonb;
 alter table public.profiles add column if not exists last_spot_check_at timestamptz;
 -- Last time the driver was Online (last_online_at is cleared when they go Offline).
 alter table public.profiles add column if not exists last_active_at timestamptz;
+-- Random ids of the phones/browsers the driver has gone online from (newest first, up to 5).
+alter table public.profiles add column if not exists known_devices text[] not null default '{}';
+-- Background check (Checkr candidate, last result).
+alter table public.profiles add column if not exists background_candidate_id text;
+alter table public.profiles add column if not exists background_status text check (background_status in ('clear', 'consider'));
+alter table public.profiles add column if not exists background_checked_at timestamptz;
+create index if not exists profiles_background_candidate_idx on public.profiles (background_candidate_id) where background_candidate_id is not null;
+
+-- Licence and insurance expiry, for reminders before they lapse.
+alter table public.driver_applications add column if not exists license_expires_on date;
+alter table public.driver_applications add column if not exists insurance_expires_on date;
 
 create table if not exists public.driver_flags (
   id uuid primary key default gen_random_uuid(),
@@ -24,7 +35,7 @@ create index if not exists driver_flags_driver_reason_idx on public.driver_flags
 create table if not exists public.driver_checks (
   id uuid primary key default gen_random_uuid(),
   driver_id uuid not null references public.profiles (id) on delete cascade,
-  kind text not null check (kind in ('identity', 'liveness', 'id_document', 'vehicle_photo', 'plate_photo', 'location_photo')),
+  kind text not null check (kind in ('identity', 'liveness', 'id_document', 'insurance_document', 'vehicle_photo', 'plate_photo', 'location_photo', 'background')),
   reason text not null check (char_length(reason) between 1 and 40),
   clears text not null default 'review' check (clears in ('submit', 'review', 'provider')),
   status text not null default 'pending' check (status in ('pending', 'submitted', 'passed', 'failed', 'cancelled')),
@@ -37,7 +48,9 @@ create table if not exists public.driver_checks (
   submitted_at timestamptz,
   reviewed_at timestamptz,
   reviewed_by uuid references public.profiles (id) on delete set null,
-  review_note text
+  review_note text,
+  -- A pending check with a future due date (document expiring) does not block until then.
+  due_at timestamptz
 );
 create index if not exists driver_checks_driver_idx on public.driver_checks (driver_id, created_at desc);
 create index if not exists driver_checks_open_idx on public.driver_checks (status, created_at desc) where status in ('pending', 'submitted', 'failed');
