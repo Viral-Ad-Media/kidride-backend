@@ -4,17 +4,28 @@ const express = require('express');
 const cors = require('cors');
 const connectDB = require('./config/db');
 const { createRateLimiter, parsePositiveInt } = require('./middleware/rateLimitMiddleware');
+const { requestContext } = require('./middleware/requestContext');
+const { initMonitoring, captureError, flushMonitoring } = require('./lib/monitoring');
+const { logEnvironmentWarnings, isProduction } = require('./lib/envCheck');
+
+initMonitoring();
+logEnvironmentWarnings();
 
 const app = express();
+app.disable('x-powered-by');
 app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || (process.env.VERCEL ? 1 : 0)));
-const allowedOrigins = (process.env.FRONTEND_URLS || 'http://localhost:3000,http://localhost:5173')
-  .split(',').map(origin => origin.trim()).filter(Boolean);
+// Production never falls back to localhost origins.
+const defaultOrigins = isProduction() ? 'https://kid-ride.vercel.app' : 'http://localhost:3001,http://localhost:3000,http://localhost:5173';
+const allowedOrigins = (process.env.FRONTEND_URLS || defaultOrigins)
+  .split(',').map(origin => origin.trim().replace(/\/+$/, '')).filter(Boolean);
+app.use(requestContext);
 app.use(cors({
   origin: (origin, callback) => !origin || allowedOrigins.includes(origin)
-    ? callback(null, true) : callback(new Error('Not allowed by CORS')),
-  credentials: true
+    ? callback(null, true) : callback(Object.assign(new Error('Origin not allowed'), { status: 403 })),
+  credentials: true,
+  maxAge: 600
 }));
-app.use(express.json());
+app.use(express.json({ limit: '100kb' }));
 // Express 5 leaves req.body undefined when no JSON body was parsed.
 app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next(); });
 
@@ -57,13 +68,47 @@ const status = (_req, res) => {
 app.get('/', status);
 app.get('/health', (_req, res) => res.set('Cache-Control', 'no-store').json({ status: 'alive' }));
 app.get('/api/health', status);
+// Readiness for uptime monitors: one cheap database read, cached for 30 seconds
+// so the public endpoint cannot be used to load the database.
+let readiness = { at: 0, ok: false };
+app.get('/api/health/ready', async (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!apiRouter) return res.status(503).json({ status: 'unavailable', database: 'not_checked' });
+  if (Date.now() - readiness.at > 30000) {
+    let ok = false;
+    try {
+      const { supabaseAdmin } = require('./config/supabase');
+      const query = supabaseAdmin.from('pricing_settings').select('id', { head: true, count: 'exact' }).limit(1);
+      const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Database check timed out')), 3000).unref?.());
+      const { error } = await Promise.race([query, timeout]);
+      if (error) throw error;
+      ok = true;
+    } catch (error) {
+      console.error('Readiness check failed:', error.message);
+      captureError(error, { route: '/api/health/ready' });
+    }
+    readiness = { at: Date.now(), ok };
+  }
+  res.status(readiness.ok ? 200 : 503).json({ status: readiness.ok ? 'ready' : 'degraded', database: readiness.ok ? 'ok' : 'error', checkedAt: new Date(readiness.at).toISOString() });
+});
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 app.use('/api', apiRouter || ((_req, res) => res.status(503).json({ message: 'Service configuration unavailable. Contact support.' })));
 app.use((_req, res) => res.status(404).json({ message: 'Not found' }));
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
   if (res.headersSent) return _next(error);
   const statusCode = error.status >= 400 && error.status < 500 ? error.status : 500;
-  res.status(statusCode).json({ message: statusCode === 400 ? 'Invalid request body' : 'Request failed' });
+  if (statusCode === 500) {
+    console.error(JSON.stringify({ level: 'error', requestId: req.id, message: error.message, stack: error.stack }));
+    captureError(error, { requestId: req.id, route: req.originalUrl.split('?')[0], userId: req.user?.id });
+    flushMonitoring();
+  }
+  const messages = { 400: 'Invalid request body', 403: 'Forbidden', 413: 'Request too large' };
+  res.status(statusCode).json({ message: messages[statusCode] || 'Request failed', requestId: req.id });
+});
+
+process.on('unhandledRejection', reason => {
+  console.error('Unhandled promise rejection:', reason);
+  captureError(reason instanceof Error ? reason : new Error(String(reason)));
 });
 
 // Vercel calls the exported Express handler; importing it must not open a port.
