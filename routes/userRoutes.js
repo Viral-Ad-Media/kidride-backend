@@ -12,6 +12,10 @@ const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload, removeUnusedUploads } = require('../lib/verification');
+const driverChecks = require('../lib/driverChecks');
+const identityProvider = require('../lib/identityProvider');
+const { loadSafety } = require('../lib/safetySettings');
+const { normalizeSafety, DEFAULT_SAFETY } = require('../lib/safety');
 const { validateCoordinates } = require('../lib/security');
 const { saveDriverLocation } = require('../lib/dispatch');
 const router = express.Router();
@@ -58,6 +62,10 @@ router.put('/profile', protect, async (req, res) => {
     }
 
     await updateProfileRowById(req.user.id, updates);
+    // An approved driver changing their phone number must show their car and plate again.
+    if (req.user.role === 'driver' && req.user.driverApplicationStatus === 'approved' && typeof updates.phone === 'string' && updates.phone !== (req.user.phone || '')) {
+      try { await driverChecks.flag(req.user.id, 'details_changed', { details: { changed: 'phone' } }); } catch (error) { console.error('Re-verification flag failed', error); }
+    }
     const updatedUser = await fetchUserById(req.user.id);
     return res.json(formatUser(updatedUser));
   } catch (error) {
@@ -165,7 +173,19 @@ router.put('/me/presence', protect, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
   const online = req.body.online === true;
   try {
-    const { error } = await supabaseAdmin.from('profiles').update({ last_online_at: online ? new Date().toISOString() : null }).eq('id', req.user.id);
+    // Going online may trigger a spot check, an inactivity check or a yearly ID renewal;
+    // an open check keeps the driver offline until it is done.
+    if (online && req.user.driverApplicationStatus === 'approved') {
+      let settings;
+      try { settings = await loadSafety(); } catch { settings = normalizeSafety(DEFAULT_SAFETY); }
+      const here = typeof req.body.latitude === 'number' && validateCoordinates({ latitude: req.body.latitude, longitude: req.body.longitude }) ? { latitude: req.body.latitude, longitude: req.body.longitude } : null;
+      if (await driverChecks.gateOnline(req.user.id, settings, { deviceId: req.body.deviceId, position: here })) {
+        await supabaseAdmin.from('profiles').update({ last_online_at: null }).eq('id', req.user.id);
+        return res.status(403).json({ message: 'Complete your verification checks to go online.', code: 'verification_required' });
+      }
+    }
+    const now = new Date().toISOString();
+    const { error } = await supabaseAdmin.from('profiles').update({ last_online_at: online ? now : null, ...(online ? { last_active_at: now } : {}) }).eq('id', req.user.id);
     if (error) throw error;
     const position = { latitude: req.body.latitude, longitude: req.body.longitude, heading: req.body.heading };
     if (online && typeof position.latitude === 'number') {
@@ -202,12 +222,23 @@ router.post('/driver-application', protect, async (req, res) => {
       : { make, model, year, color, plate };
 
     if (typeof phone !== 'string' || !phone.trim() || !['make', 'model', 'year', 'color', 'plate'].every(key => typeof incomingVehicle[key] === 'string' && incomingVehicle[key].trim())) return res.status(400).json({ message: 'Phone and complete vehicle details required' });
+    // Expiry dates (YYYY-MM-DD, in the future) so KidRide can ask for new photos before they lapse.
+    const futureDate = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && new Date(`${value}T23:59:59Z`) > new Date();
+    const { licenseExpiresOn, insuranceExpiresOn } = req.body;
+    if (!futureDate(licenseExpiresOn) || !futureDate(insuranceExpiresOn)) return res.status(400).json({ message: 'Enter the expiry dates of your licence and insurance' });
+    const wasApproved = req.user.driverApplicationStatus === 'approved';
+    const oldVehicle = req.user.vehicle || {};
+    const carChanged = wasApproved && ['make', 'model', 'color', 'plate'].some((key) => String(oldVehicle[key] || '').trim().toLowerCase() !== String(incomingVehicle[key] || '').trim().toLowerCase());
     const { error: submissionError } = await supabaseAdmin.rpc('submit_driver_application', {
       applicant_id: req.user.id, application_documents: req.body.documents,
       applicant_phone: phone.trim(), applicant_vehicle: incomingVehicle
     });
     if (submissionError) throw submissionError;
+    await supabaseAdmin.from('driver_applications').update({ license_expires_on: licenseExpiresOn, insurance_expires_on: insuranceExpiresOn }).eq('driver_id', req.user.id);
     await removeUnusedUploads(req.user.id, req.body.documents);
+    if (carChanged) { try { await driverChecks.flag(req.user.id, 'details_changed', { details: { changed: 'vehicle' } }); } catch (error) { console.error('Re-verification flag failed', error); } }
+    // New applicants verify their identity and do a first face check (the reference for later checks).
+    try { await driverChecks.flag(req.user.id, 'onboarding'); } catch (error) { console.error('Onboarding checks not created', error); }
 
     const updatedUser = await fetchUserById(req.user.id);
 
@@ -306,6 +337,9 @@ router.put('/driver-applications/:id/review', protect, async (req, res) => {
     if (error || !await validateDocuments(user.id, data?.documents)) return res.status(400).json({ message: 'Application documents missing' });
     // Operator approval must follow the operator's actual background-check process.
     if (typeof req.body.submittedAt !== 'string') return res.status(400).json({ message: 'Review the current documents and include submittedAt' });
+    if (req.body.status === 'approved' && identityProvider.isReady() && (await driverChecks.identityState(user.id)).status !== 'verified') {
+      return res.status(409).json({ message: 'This driver has not passed ID verification yet' });
+    }
     const { data: updated, error: updateError } = await supabaseAdmin.rpc('review_driver_application', {
       applicant_id: user.id, reviewed_submission: req.body.submittedAt, review_status: req.body.status
     });

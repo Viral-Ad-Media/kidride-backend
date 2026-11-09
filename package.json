@@ -12,6 +12,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@aws-sdk/client-rekognition": "^3.1165.0",
     "@sentry/node": "^11.11.0",
     "@supabase/supabase-js": "^2.57.4",
     "cors": "^2.8.5",

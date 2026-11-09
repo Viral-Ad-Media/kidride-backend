@@ -25,6 +25,29 @@ app.use(cors({
   credentials: true,
   maxAge: 600
 }));
+// Stripe Identity webhook: needs the raw body to check the signature, so it runs before the JSON parser.
+app.post('/api/webhooks/stripe-identity', express.raw({ type: 'application/json', limit: '200kb' }), async (req, res) => {
+  try {
+    const { parseWebhook } = require('./lib/identityProvider');
+    const result = parseWebhook(req.body.toString('utf8'), req.get('stripe-signature'));
+    if (result?.driverId) await require('./lib/driverChecks').applyIdentityResult(result.driverId, result);
+    return res.json({ received: true });
+  } catch (error) {
+    if (error.status >= 500 || !error.status) console.error('Identity webhook failed', error.message);
+    return res.status(error.status && error.status < 500 ? error.status : 500).json({ message: 'Webhook rejected' });
+  }
+});
+// Checkr background check results (same raw-body rule as above).
+app.post('/api/webhooks/checkr', express.raw({ type: 'application/json', limit: '200kb' }), async (req, res) => {
+  try {
+    const result = require('./lib/backgroundCheck').parseCheckrWebhook(req.body.toString('utf8'), req.get('x-checkr-signature'));
+    if (result?.candidateId) await require('./lib/driverChecks').applyBackgroundResult(result);
+    return res.json({ received: true });
+  } catch (error) {
+    if (error.status >= 500 || !error.status) console.error('Checkr webhook failed', error.message);
+    return res.status(error.status && error.status < 500 ? error.status : 500).json({ message: 'Webhook rejected' });
+  }
+});
 app.use(express.json({ limit: '100kb' }));
 // Express 5 leaves req.body undefined when no JSON body was parsed.
 app.use((req, _res, next) => { if (req.body === undefined) req.body = {}; next(); });
@@ -45,6 +68,9 @@ try {
   router.use('/users', require('./routes/adminUserRoutes'));
   router.use('/users', require('./routes/userRoutes'));
   router.use('/drivers', require('./routes/driverRoutes'));
+  const driverChecks = require('./routes/driverCheckRoutes');
+  router.use('/driver-checks', driverChecks.router);
+  router.use('/admin/verification', driverChecks.admin);
   router.use('/admin/live-map', require('./routes/adminLiveRoutes'));
   router.use('/admin/pricing', require('./routes/adminPricingRoutes'));
   router.use('/admin/safety', require('./routes/adminSafetyRoutes'));

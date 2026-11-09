@@ -26,6 +26,8 @@ const { loadSafety } = require('../lib/safetySettings');
 const { DEFAULT_SAFETY, normalizeSafety, tripCodeMatches, evaluatePosition, noShowTerms } = require('../lib/safety');
 const { generateForParent, generateAll } = require('../lib/seriesGenerator');
 const { recordIncident, listIncidents, resolveIncidents } = require('../lib/incidents');
+const driverChecks = require('../lib/driverChecks');
+const { trafficFactor } = require('../lib/routeMetrics');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
@@ -440,12 +442,19 @@ router.put('/:id/location', protect, async (req, res) => {
     const driver_location = { latitude: req.body.latitude, longitude: req.body.longitude, accuracy: req.body.accuracy ?? null, heading: req.body.heading ?? null, speed: req.body.speed ?? null, recordedAt: new Date().toISOString() };
     // With the child onboard, watch for the car leaving the route or stopping. Fixes
     // vaguer than 200 m are skipped so poor GPS does not raise false alarms.
+    const position = { lat: req.body.latitude, lng: req.body.longitude };
+    // Traffic on the way to the drop-off, measured once per trip, so stops in known congestion are allowed.
+    if (ride.status === 'child_picked_up' && ride.dropoff_coords && !(ride.monitor && 'trafficFactor' in ride.monitor)) {
+      ride.monitor = { ...(ride.monitor || {}), trafficFactor: (await safely(() => trafficFactor(position, ride.dropoff_coords), 'Traffic lookup failed')) || 1 };
+    }
     const watch = ride.status === 'child_picked_up' && !(req.body.accuracy > 200)
-      ? await safely(async () => evaluatePosition(await safetySettings(), ride, { lat: req.body.latitude, lng: req.body.longitude }), 'Route watch failed')
+      ? await safely(async () => evaluatePosition(await safetySettings(), ride, position), 'Route watch failed')
       : null;
     const updated = await updateRideRow(ride.id, { driver_location, ...(watch ? { monitor: watch.monitor } : {}) }, ride.status, req.user.id);
     for (const alert of watch?.alerts || []) {
       await safely(() => recordIncident(updated, alert.kind, { location: driver_location, details: alert.details }), 'Route alert failed');
+      // Unusual driving can require the driver to verify again before the next ride.
+      await safely(() => driverChecks.flag(req.user.id, alert.kind, { rideId: ride.id, details: alert.details }), 'Re-verification flag failed');
     }
     return res.json(driver_location);
   } catch (error) { return sendError(res, error); }
@@ -512,6 +521,9 @@ router.put('/:id/accept', protect, async (req, res) => {
     }
     if (existingRide.driver_id && existingRide.driver_id !== req.user.id) {
       return res.status(409).json({ message: 'Ride already accepted by another driver' });
+    }
+    if (req.user.role !== 'admin' && await driverChecks.isBlocked(req.user.id)) {
+      return res.status(403).json({ message: 'Complete your verification checks before taking new rides.', code: 'verification_required' });
     }
     if (req.user.role !== 'admin' && scheduling.isHeld(existingRide)) {
       return res.status(409).json({ message: 'This ride is booked for later and is not open to drivers yet.' });
@@ -692,6 +704,7 @@ const checkTripCode = async (ride, entered, user) => {
   if (!data) return { status: 409, body: { message: 'Ride changed. Enter the code again.' } };
   const locked = attempt >= max;
   await safely(() => recordIncident(data, 'trip_code', { userId: user.id, role: 'driver', location: data.driver_location || null, details: { attempt, maxAttempts: max, locked } }), 'Trip code incident failed');
+  if (locked) await safely(() => driverChecks.flag(user.id, 'trip_code_locked', { rideId: data.id, details: { attempt } }), 'Re-verification flag failed');
   const left = max - attempt;
   return { status: locked ? 423 : 422, body: { message: locked ? LOCKED_MESSAGE : `That code does not match. Ask for the 4-digit trip code. ${left} ${left === 1 ? 'try' : 'tries'} left.`, locked, attemptsLeft: left } };
 };
@@ -774,6 +787,7 @@ router.post('/:id/sos', protect, sosLimiter, async (req, res) => {
       location,
       details: { ...(note ? { note } : {}), ...(location ? { where: `${location.latitude.toFixed(4)}, ${location.longitude.toFixed(4)}` } : {}) }
     });
+    if (role === 'parent' && ride.driver_id) await safely(() => driverChecks.flag(ride.driver_id, 'parent_sos', { rideId: ride.id }), 'Re-verification flag failed');
     emitRideUpdate(req, updated, 'ride_safety_alert');
     return res.status(201).json({ incident, ride: formatRideFor(req.user, updated) });
   } catch (error) {
@@ -847,6 +861,7 @@ router.post('/:id/rating', protect, async (req, res) => {
       .select('stars, comment, created_at').single();
     if (error?.code === '23505') return res.status(409).json({ message: 'You have already rated this ride' });
     if (error) throw error;
+    if (stars <= 2) await safely(() => driverChecks.flag(ride.driver_id, 'low_rating', { rideId: ride.id, details: { stars } }), 'Re-verification flag failed');
     return res.status(201).json({ rideId: ride.id, stars: data.stars, comment: data.comment || null, createdAt: data.created_at });
   } catch (error) {
     return sendError(res, error, 'Unable to save your rating');
