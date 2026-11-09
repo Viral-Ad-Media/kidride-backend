@@ -75,6 +75,11 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
     if (blockingRide(openRides)) throw accountError(409, 'You have a ride in progress. Finish or cancel it before deleting your account.');
 
     const now = new Date();
+    // Repeating bookings stop first, so no new rides are created for the account.
+    if (user.role === 'parent') {
+      const { error } = await supabaseAdmin.from('ride_series').update({ status: 'cancelled', updated_at: now.toISOString() }).eq('parent_id', user.id).eq('status', 'active');
+      if (error && error.code !== '42P01') throw error;
+    }
     // Unstarted scheduled rides: a parent's are cancelled, a driver's go back to dispatch.
     const scheduled = openRides.map((ride) => ride.id);
     if (scheduled.length) {
