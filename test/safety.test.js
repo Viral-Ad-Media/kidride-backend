@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { normalizeSafety, tripCodeMatches, milesFromSegment, evaluatePosition, outranks, noShowTerms } = require('../lib/safety');
+const { DEFAULT_SAFETY, normalizeSafety, tripCodeMatches, milesFromSegment, evaluatePosition, outranks, noShowTerms } = require('../lib/safety');
 const { normalizeSettings } = require('../lib/pricing');
 
 const safety = normalizeSafety({});
@@ -21,7 +21,7 @@ test('trip codes match exactly, ignoring spaces', () => {
 });
 
 test('safety settings fall back to defaults and reject bad values', () => {
-  assert.deepEqual(safety, { tripCodeMaxAttempts: 5, offRouteMiles: 1.5, stalledMinutes: 5, stalledRadiusMeters: 100, dropoffQuietMeters: 300 });
+  assert.deepEqual(safety, DEFAULT_SAFETY);
   assert.equal(normalizeSafety({ offRouteMiles: 0.5 }).offRouteMiles, 0.5);
   assert.throws(() => normalizeSafety({ tripCodeMaxAttempts: 0 }), /Trip code attempts/);
   assert.throws(() => normalizeSafety({ stalledMinutes: 2.5 }), /whole number/);
@@ -38,6 +38,7 @@ test('distance from the route is measured to the nearest point of the pickup-to-
 });
 
 test('off route alerts once, then re-arms after the car comes back', () => {
+  const safety = { ...normalizeSafety({}), maxSpeedKph: 1000 }; // the test car teleports
   const far = { lat: 40.73, lng: -73.95 }; // about 2.3 miles east of the line
   const first = evaluatePosition(safety, onboard({}), far, at(0));
   assert.deepEqual(first.alerts.map((a) => a.kind), ['off_route']);
@@ -91,4 +92,37 @@ test('no-show rules live in the pricing cancellation settings', () => {
   assert.equal(pricing.cancellation.noShowFee, 10);
   assert.equal(normalizeSettings({ cancellation: { noShowFee: 12.5 } }).cancellation.noShowFee, 12.5);
   assert.throws(() => normalizeSettings({ cancellation: { noShowWaitMinutes: 500 } }), /No-show wait/);
+});
+
+test('drove past the drop-off: alerts once after reaching it and moving well away', () => {
+  const nearDrop = { lat: dropoff.lat - 0.0009, lng: dropoff.lng }; // ~100 m short
+  const beyond = { lat: dropoff.lat + 0.009, lng: dropoff.lng }; // ~1 km past
+  let { monitor, alerts } = evaluatePosition(safety, onboard({}), nearDrop, at(0));
+  assert.deepEqual(alerts, []);
+  ({ monitor, alerts } = evaluatePosition(safety, onboard(monitor), beyond, at(1)));
+  assert.deepEqual(alerts.map((a) => a.kind), ['overshoot']);
+  ({ alerts } = evaluatePosition(safety, onboard(monitor), { lat: beyond.lat + 0.001, lng: beyond.lng }, at(2)));
+  assert.deepEqual(alerts, [], 'once per trip');
+});
+
+test('frequent stops: counts stops of 2+ minutes away from the ends, alerts at the limit', () => {
+  let monitor = {};
+  let fired = [];
+  // Four stops of 3 minutes along the way, each 400 m further north.
+  for (let i = 0; i < 5; i++) {
+    const spot = { lat: 40.72 + i * 0.0036, lng: -74.002 };
+    let result = evaluatePosition(safety, onboard(monitor), spot, at(i * 4));
+    fired = fired.concat(result.alerts.map((a) => a.kind));
+    result = evaluatePosition(safety, onboard(result.monitor), spot, at(i * 4 + 3));
+    fired = fired.concat(result.alerts.map((a) => a.kind));
+    monitor = result.monitor;
+  }
+  assert.equal(monitor.stops, 4);
+  assert.deepEqual(fired.filter((k) => k === 'frequent_stops'), ['frequent_stops']);
+});
+
+test('an impossible jump between fixes is flagged as a GPS jump', () => {
+  const { monitor } = evaluatePosition(safety, onboard({}), pickup, at(0));
+  const jumped = evaluatePosition(safety, onboard(monitor), { lat: pickup.lat + 0.2, lng: pickup.lng }, new Date(at(0).getTime() + 30000));
+  assert.ok(jumped.alerts.some((a) => a.kind === 'gps_jump'));
 });

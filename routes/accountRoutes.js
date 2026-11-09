@@ -108,7 +108,15 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
         const { data } = await supabaseAdmin.storage.from(BUCKET).list(`${user.id}/${kind}`, { limit: 100 });
         for (const item of data || []) paths.push(`${user.id}/${kind}/${item.name}`);
       }
+      // Verification check photos (face checks, car, plate, location).
+      const { data: checkFolders } = await supabaseAdmin.storage.from(BUCKET).list(`${user.id}/checks`, { limit: 1000 });
+      for (const folder of checkFolders || []) {
+        const { data } = await supabaseAdmin.storage.from(BUCKET).list(`${user.id}/checks/${folder.name}`, { limit: 100 });
+        for (const item of data || []) paths.push(`${user.id}/checks/${folder.name}/${item.name}`);
+      }
       if (paths.length) await supabaseAdmin.storage.from(BUCKET).remove(paths);
+      await supabaseAdmin.from('driver_checks').update({ evidence: null, challenge: null, details: null }).eq('driver_id', user.id);
+      await supabaseAdmin.from('profiles').update({ identity_session_id: null, identity_error: null }).eq('id', user.id);
       const { error } = await supabaseAdmin.from('driver_applications').delete().eq('driver_id', user.id);
       if (error) throw error;
     }

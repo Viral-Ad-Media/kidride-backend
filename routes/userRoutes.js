@@ -12,6 +12,10 @@ const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload, removeUnusedUploads } = require('../lib/verification');
+const driverChecks = require('../lib/driverChecks');
+const identityProvider = require('../lib/identityProvider');
+const { loadSafety } = require('../lib/safetySettings');
+const { normalizeSafety, DEFAULT_SAFETY } = require('../lib/safety');
 const { validateCoordinates } = require('../lib/security');
 const { saveDriverLocation } = require('../lib/dispatch');
 const router = express.Router();
@@ -165,7 +169,18 @@ router.put('/me/presence', protect, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
   const online = req.body.online === true;
   try {
-    const { error } = await supabaseAdmin.from('profiles').update({ last_online_at: online ? new Date().toISOString() : null }).eq('id', req.user.id);
+    // Going online may trigger a spot check, an inactivity check or a yearly ID renewal;
+    // an open check keeps the driver offline until it is done.
+    if (online && req.user.driverApplicationStatus === 'approved') {
+      let settings;
+      try { settings = await loadSafety(); } catch { settings = normalizeSafety(DEFAULT_SAFETY); }
+      if (await driverChecks.gateOnline(req.user.id, settings)) {
+        await supabaseAdmin.from('profiles').update({ last_online_at: null }).eq('id', req.user.id);
+        return res.status(403).json({ message: 'Complete your verification checks to go online.', code: 'verification_required' });
+      }
+    }
+    const now = new Date().toISOString();
+    const { error } = await supabaseAdmin.from('profiles').update({ last_online_at: online ? now : null, ...(online ? { last_active_at: now } : {}) }).eq('id', req.user.id);
     if (error) throw error;
     const position = { latitude: req.body.latitude, longitude: req.body.longitude, heading: req.body.heading };
     if (online && typeof position.latitude === 'number') {
@@ -208,6 +223,8 @@ router.post('/driver-application', protect, async (req, res) => {
     });
     if (submissionError) throw submissionError;
     await removeUnusedUploads(req.user.id, req.body.documents);
+    // New applicants verify their identity and do a first face check (the reference for later checks).
+    try { await driverChecks.flag(req.user.id, 'onboarding'); } catch (error) { console.error('Onboarding checks not created', error); }
 
     const updatedUser = await fetchUserById(req.user.id);
 
@@ -306,6 +323,9 @@ router.put('/driver-applications/:id/review', protect, async (req, res) => {
     if (error || !await validateDocuments(user.id, data?.documents)) return res.status(400).json({ message: 'Application documents missing' });
     // Operator approval must follow the operator's actual background-check process.
     if (typeof req.body.submittedAt !== 'string') return res.status(400).json({ message: 'Review the current documents and include submittedAt' });
+    if (req.body.status === 'approved' && identityProvider.isReady() && (await driverChecks.identityState(user.id)).status !== 'verified') {
+      return res.status(409).json({ message: 'This driver has not passed ID verification yet' });
+    }
     const { data: updated, error: updateError } = await supabaseAdmin.rpc('review_driver_application', {
       applicant_id: user.id, reviewed_submission: req.body.submittedAt, review_status: req.body.status
     });
