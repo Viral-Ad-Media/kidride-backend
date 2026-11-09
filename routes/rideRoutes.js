@@ -20,6 +20,7 @@ const scheduling = require('../lib/scheduling');
 const { loadPricing } = require('../lib/pricingSettings');
 const { cancellationFee } = require('../lib/pricing');
 const { quoteAllServices, verifyQuote } = require('../lib/fareQuotes');
+const { MAX_CHILDREN_PER_RIDE } = require('../lib/pricing');
 const { timingSafeEqual } = require('node:crypto');
 const { loadSafety } = require('../lib/safetySettings');
 const { DEFAULT_SAFETY, normalizeSafety, tripCodeMatches, evaluatePosition, noShowTerms } = require('../lib/safety');
@@ -80,15 +81,25 @@ const rideRequestLimiter = createRateLimiter({
 
 const MAX_OPEN_RIDE_FETCH = 100;
 
+// childIds (several children in one car) or the older single childId. Returns
+// distinct ids, first child first, or null when the list is malformed.
+const requestedChildIds = (body) => {
+  const raw = Array.isArray(body.childIds) ? body.childIds : [body.childId || body.child];
+  if (!raw.length || raw.length > MAX_CHILDREN_PER_RIDE || raw.some((id) => typeof id !== 'string' || !id)) return null;
+  const ids = [...new Set(raw)];
+  return ids.length === raw.length ? ids : null;
+};
+
 const normalizeRideRequestPayload = (body) => {
   if (body.serviceType && !VALID_SERVICE_TYPES.includes(body.serviceType)) return { error: 'Invalid service type' };
-  const child = body.childId || body.child;
+  const childIds = requestedChildIds(body);
+  const child = childIds?.[0];
   const pickupLocation = body.pickupLocation || body.pickup;
   const dropoffLocation = body.dropoffLocation || body.dropoff;
   const pickupTime = body.pickupTime ? new Date(body.pickupTime) : undefined;
 
   if (typeof child !== 'string' || typeof pickupLocation !== 'string' || !pickupLocation.trim() || typeof dropoffLocation !== 'string' || !dropoffLocation.trim()) {
-    return { error: 'childId, pickup/pickupLocation, and dropoff/dropoffLocation are required' };
+    return { error: `childIds (1 to ${MAX_CHILDREN_PER_RIDE} different children), pickup/pickupLocation, and dropoff/dropoffLocation are required` };
   }
   if (pickupTime && Number.isNaN(pickupTime.getTime())) {
     return { error: 'pickupTime must be a valid date' };
@@ -104,6 +115,7 @@ const normalizeRideRequestPayload = (body) => {
 
   return {
     child: String(child),
+    childIds,
     pickupLocation: String(pickupLocation).trim(),
     dropoffLocation: String(dropoffLocation).trim(),
     pickupTime,
@@ -141,8 +153,9 @@ const fetchDeclinedRideIdsByDriver = async (driverId) => {
 router.post('/request', protect, rideRequestLimiter, async (req, res) => {
   try {
     if (req.user.role !== 'parent') return res.status(403).json({ message: 'Only parents can request rides' });
-    const childId = req.body.childId || req.body.child;
-    if (!(req.user.children || []).some(child => child.id === childId)) return res.status(403).json({ message: 'Select a child from your account' });
+    const ownChildIds = new Set((req.user.children || []).map((child) => child.id));
+    const childIds = requestedChildIds(req.body);
+    if (childIds && !childIds.every((id) => ownChildIds.has(id))) return res.status(403).json({ message: 'Select children from your account' });
     const normalized = normalizeRideRequestPayload(req.body);
     if (normalized.error) {
       return res.status(normalized.status || 400).json({ message: normalized.error });
@@ -155,7 +168,8 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       pickupAddress: normalized.pickupLocation,
       dropoffAddress: normalized.dropoffLocation,
       scheduledAt: normalized.scheduled ? normalized.pickupTime.toISOString() : null,
-      stayMinutes: normalized.stayMinutes
+      stayMinutes: normalized.stayMinutes,
+      childCount: normalized.childIds.length
     });
     if (!fare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
     if (normalized.scheduled) {
@@ -169,6 +183,7 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       .insert({
         parent_id: req.user.id,
         child_id: normalized.child,
+        child_ids: normalized.childIds,
         pickup_location: normalized.pickupLocation,
         dropoff_location: normalized.dropoffLocation,
         pickup_time: normalized.pickupTime ? normalized.pickupTime.toISOString() : null,
@@ -405,7 +420,9 @@ router.post('/quotes', protect, async (req, res) => {
   }
   const stayMinutes = req.body.stayMinutes === undefined ? 60 : req.body.stayMinutes;
   if (!Number.isInteger(stayMinutes) || stayMinutes < 0) return res.status(400).json({ message: 'Stay time must be whole minutes' });
-  try { return res.json(await quoteAllServices(await loadPricing(), req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes })); }
+  const childCount = req.body.childCount === undefined ? 1 : req.body.childCount;
+  if (!Number.isInteger(childCount) || childCount < 1 || childCount > MAX_CHILDREN_PER_RIDE) return res.status(400).json({ message: `Choose 1 to ${MAX_CHILDREN_PER_RIDE} children` });
+  try { return res.json(await quoteAllServices(await loadPricing(), req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes, childCount })); }
   catch (error) { return sendError(res, error, 'Unable to price this trip'); }
 });
 

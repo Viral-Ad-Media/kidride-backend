@@ -141,10 +141,10 @@ router.delete('/children/:id', protect, async (req, res) => {
     const child = await loadOwnChild(req, res);
     if (!child) return undefined;
     const { data: activeRides, error: rideError } = await supabaseAdmin.from('rides').select('id')
-      .eq('child_id', child.id).not('status', 'in', '(completed,cancelled)').limit(1);
+      .contains('child_ids', [child.id]).not('status', 'in', '(completed,cancelled)').limit(1);
     if (rideError) throw rideError;
     if (activeRides?.length) return res.status(409).json({ message: 'This child has a ride in progress. Finish or cancel it before removing them.' });
-    const { data: pastRides, error: historyError } = await supabaseAdmin.from('rides').select('id').eq('child_id', child.id).limit(1);
+    const { data: pastRides, error: historyError } = await supabaseAdmin.from('rides').select('id').contains('child_ids', [child.id]).limit(1);
     if (historyError) throw historyError;
     // Rides reference the child, so one with history is archived rather than deleted.
     const { error } = pastRides?.length
