@@ -28,7 +28,7 @@ The local server defaults to port 5000. Configure the environment before startin
 | `SERVICE_PRICES_JSON` | Approved positive USD fixed fares by service type |
 | `GEMINI_API_KEY` | Backend-only Gemini key for safety chat |
 | `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` | Browser push alert keys. Make once with `npx web-push generate-vapid-keys`; unset = push off (inbox and email still work) |
-| `VAPID_SUBJECT` | Optional contact for push services, e.g. `mailto:support@yourdomain` |
+| `VAPID_SUBJECT` | Optional contact for push services, defaults to `mailto:viraladmediacontent@gmail.com` |
 | `EXPO_ACCESS_TOKEN` | Optional Expo server access token when enhanced push security is enabled |
 | `CRON_SECRET` | Private bearer secret for scheduled receipt processing |
 | `UPLOAD_RATE_LIMIT_WINDOW_MS`, `UPLOAD_RATE_LIMIT_MAX_REQUESTS` | Signed verification-upload URLs per driver account (default 30 per hour) |
