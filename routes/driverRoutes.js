@@ -3,6 +3,7 @@ const { protect } = require('../middleware/authMiddleware');
 const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { fetchRatingSummaries } = require('../lib/ratings');
+const { DRIVER_TAGS, tagLabel, schemaMissing } = require('../lib/ratingRules');
 const { RIDE_SELECT, fetchRideRows, formatRide } = require('../lib/repository');
 const { isApprovedDriver, redactOffer, validateCoordinates } = require('../lib/security');
 const dispatch = require('../lib/dispatch');
@@ -72,16 +73,13 @@ router.get('/:id/rating-summary', protect, async (req, res) => {
     const canSeeReviews = req.user.role === 'admin' || req.user.id === req.params.id;
     let reviews = [];
     if (canSeeReviews) {
-      const { data, error } = await supabaseAdmin
-        .from('ride_ratings')
-        .select('stars, comment, created_at')
-        .eq('driver_id', req.params.id)
-        .order('created_at', { ascending: false })
-        .limit(20);
+      const load = (columns) => supabaseAdmin.from('ride_ratings').select(columns).eq('driver_id', req.params.id).order('created_at', { ascending: false }).limit(20);
+      let { data, error } = await load('stars, tags, comment, created_at');
+      if (schemaMissing(error)) ({ data, error } = await load('stars, comment, created_at'));
       if (error) throw error;
-      reviews = (data || []).map((row) => ({ stars: row.stars, comment: row.comment || null, createdAt: row.created_at }));
+      reviews = (data || []).map((row) => ({ stars: row.stars, tags: (row.tags || []).map((tag) => tagLabel(DRIVER_TAGS, tag)), comment: row.comment || null, createdAt: row.created_at }));
     }
-    return res.json({ driverId: req.params.id, ...summary, reviews });
+    return res.json({ driverId: req.params.id, average: summary.average, count: summary.count, compliments: summary.compliments, reviews });
   } catch (error) {
     return sendError(res, error, 'Unable to load ratings');
   }

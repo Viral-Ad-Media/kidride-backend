@@ -28,13 +28,14 @@ router.get('/export', protect, accountLimiter, async (req, res) => {
   try {
     const id = req.user.id;
     const rideColumn = req.user.role === 'driver' ? 'driver_id' : 'parent_id';
-    const [profile, children, rides, trustedContacts, notifications, ratings, incidents] = await Promise.all([
+    const [profile, children, rides, trustedContacts, notifications, ratings, familyRatings, incidents] = await Promise.all([
       rows(supabaseAdmin.from('profiles').select('*').eq('id', id)),
       rows(supabaseAdmin.from('children').select('id, name, age, notes, created_at, archived_at').eq('parent_id', id)),
       rows(supabaseAdmin.from('rides').select('*').eq(rideColumn, id).order('created_at', { ascending: false })),
       rows(supabaseAdmin.from('trusted_contacts').select('name, phone, relationship, created_at').eq('parent_id', id)),
       rows(supabaseAdmin.from('notifications').select('*').eq('user_id', id).order('created_at', { ascending: false }).limit(1000)),
       rows(supabaseAdmin.from('ride_ratings').select('*').or(`parent_id.eq.${id},driver_id.eq.${id}`)),
+      rows(supabaseAdmin.from('family_ratings').select('*').or(`parent_id.eq.${id},driver_id.eq.${id}`)).catch(() => []),
       rows(supabaseAdmin.from('ride_incidents').select('*').eq('reported_by', id))
     ]);
     // Internal security fields are not personal data and are left out.
@@ -52,6 +53,7 @@ router.get('/export', protect, accountLimiter, async (req, res) => {
       trustedContacts,
       notifications,
       ratings,
+      familyRatings,
       safetyReports: incidents
     });
   } catch (error) {
@@ -91,7 +93,7 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
     }
 
     // Personal data with no lasting purpose is removed outright.
-    for (const [table, column] of [['trusted_contacts', 'parent_id'], ['push_tokens', 'user_id'], ['notifications', 'user_id'], ['driver_locations', 'driver_id'], ['ride_offers', 'driver_id']]) {
+    for (const [table, column] of [['trusted_contacts', 'parent_id'], ['push_tokens', 'user_id'], ['web_push_subscriptions', 'user_id'], ['notifications', 'user_id'], ['driver_locations', 'driver_id'], ['ride_offers', 'driver_id']]) {
       const { error } = await supabaseAdmin.from(table).delete().eq(column, user.id);
       if (error && error.code !== '42P01') throw error;
     }
