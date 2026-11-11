@@ -467,6 +467,8 @@ router.put('/:id/location', protect, async (req, res) => {
       : null;
     const updated = await updateRideRow(ride.id, { driver_location, ...(watch ? { monitor: watch.monitor } : {}) }, ride.status, req.user.id);
     for (const alert of watch?.alerts || []) {
+      // Running late is news for the parent, not a safety incident or a re-verification.
+      if (alert.kind === 'running_late') { await safely(() => notifyRideEvent(updated, 'running_late', alert.details), 'Late alert failed'); continue; }
       await safely(() => recordIncident(updated, alert.kind, { location: driver_location, details: alert.details }), 'Route alert failed');
       // Unusual driving can require the driver to verify again before the next ride.
       await safely(() => driverChecks.flag(req.user.id, alert.kind, { rideId: ride.id, details: alert.details }), 'Re-verification flag failed');

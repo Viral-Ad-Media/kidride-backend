@@ -141,3 +141,26 @@ test('heavy traffic on the route allows more stops before alerting', () => {
   assert.equal(monitor.stops, 5);
   assert.deepEqual(fired.filter((k) => k === 'frequent_stops'), [], 'limit doubles to 8 in heavy traffic');
 });
+
+test('running late tells the parent once, from the quoted drive time', () => {
+  const ride = (monitor) => ({ ...onboard(monitor), fare_breakdown: { minutes: 10, distanceSource: 'google' } });
+  // Moving steadily north, slowly, so no stalled alert gets in the way.
+  const step = (i) => ({ lat: pickup.lat + i * 0.002, lng: pickup.lng });
+  let monitor;
+  let late = [];
+  for (let i = 0; i <= 16; i += 1) {
+    const result = evaluatePosition(safety, ride(monitor), step(i), at(i));
+    monitor = result.monitor;
+    late = late.concat(result.alerts.filter((a) => a.kind === 'running_late').map((a) => ({ minute: i, ...a.details })));
+  }
+  // 10 min expected: late at max(15, 15) minutes, and only once.
+  assert.equal(late.length, 1);
+  assert.equal(late[0].minute, 15);
+  assert.equal(late[0].expectedMinutes, 10);
+});
+
+test('running late falls back to a straight-line estimate without a quote', () => {
+  const first = evaluatePosition(safety, onboard(undefined), pickup, at(0));
+  // ~2.8 mi x 1.3 at 25 mph is about 9 minutes.
+  assert.ok(first.monitor.expectedMinutes >= 7 && first.monitor.expectedMinutes <= 11, String(first.monitor.expectedMinutes));
+});
