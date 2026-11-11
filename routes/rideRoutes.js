@@ -11,7 +11,7 @@ const {
   updateRideRow
 } = require('../lib/repository');
 
-const { isApprovedDriver, ACTIVE_STATUSES, redactOffer, generateTripCode, generateSafeWord, validateCoordinates, parsePlaceCoords } = require('../lib/security');
+const { isSamePlace, SAME_PLACE_MESSAGE, isApprovedDriver, ACTIVE_STATUSES, redactOffer, generateTripCode, generateSafeWord, validateCoordinates, parsePlaceCoords } = require('../lib/security');
 const { notifyRideEvent } = require('../lib/notifications');
 const { sendError } = require('../lib/http');
 const { fetchRatingSummaries, fetchFamilyRatingSummaries } = require('../lib/ratings');
@@ -116,6 +116,8 @@ const normalizeRideRequestPayload = (body) => {
   if (body.serviceType && !VALID_SERVICE_TYPES.includes(body.serviceType)) {
     return { error: `serviceType must be one of: ${VALID_SERVICE_TYPES.join(', ')}` };
   }
+
+  if (isSamePlace(pickupLocation, dropoffLocation, parsePlaceCoords(body.pickupCoords), parsePlaceCoords(body.dropoffCoords))) return { error: SAME_PLACE_MESSAGE };
 
   return {
     child: String(child),
@@ -429,6 +431,7 @@ router.post('/quotes', protect, async (req, res) => {
   const pickupAddress = typeof req.body.pickup === 'string' ? req.body.pickup.trim() : '';
   const dropoffAddress = typeof req.body.dropoff === 'string' ? req.body.dropoff.trim() : '';
   if (!pickupAddress || !dropoffAddress) return res.status(400).json({ message: 'Enter the pickup and drop-off first.' });
+  if (isSamePlace(pickupAddress, dropoffAddress, pickupCoords, dropoffCoords)) return res.status(400).json({ message: SAME_PLACE_MESSAGE });
   let scheduledAt = null;
   if (req.body.scheduled === true) {
     const pickupTime = new Date(req.body.pickupTime);

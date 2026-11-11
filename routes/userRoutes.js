@@ -11,7 +11,14 @@ const {
 const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
-const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload, removeUnusedUploads } = require('../lib/verification');
+const { BUCKET, REQUIRED_DOCUMENTS, MIME_TYPES, validateDocuments, createUpload, removeUnusedUploads, isPhotoKind, kindsIn } = require('../lib/verification');
+
+// Per-document review: { kind: { status: 'approved' | 'reupload', note, path } }. An entry only
+// counts while the application still has that exact file (a new upload needs a new review).
+const DOCUMENT_LABELS = { license: 'Driving licence', insurance: 'Insurance', registration: 'Vehicle registration', photo_front: 'Selfie (face front)', photo_left: 'Face, left side', photo_right: 'Face, right side', car_front: 'Car, front', car_back: 'Car, back', car_side: 'Car, side', car_plate: 'Licence plate' };
+const currentReviews = (documents, reviews) => Object.fromEntries(Object.entries(reviews && typeof reviews === 'object' ? reviews : {})
+  .filter(([kind, review]) => documents?.[kind] && review?.path === documents[kind] && ['approved', 'reupload'].includes(review.status))
+  .map(([kind, review]) => [kind, { status: review.status, note: review.note || null }]));
 const driverChecks = require('../lib/driverChecks');
 const identityProvider = require('../lib/identityProvider');
 const { loadSafety } = require('../lib/safetySettings');
@@ -179,9 +186,18 @@ router.put('/me/presence', protect, async (req, res) => {
       let settings;
       try { settings = await loadSafety(); } catch { settings = normalizeSafety(DEFAULT_SAFETY); }
       const here = typeof req.body.latitude === 'number' && validateCoordinates({ latitude: req.body.latitude, longitude: req.body.longitude }) ? { latitude: req.body.latitude, longitude: req.body.longitude } : null;
-      if (await driverChecks.gateOnline(req.user.id, settings, { deviceId: req.body.deviceId, position: here })) {
+      // Fail closed: if the checks cannot be run, the driver stays offline.
+      let blocked;
+      try { blocked = await driverChecks.gateOnline(req.user.id, settings, { deviceId: req.body.deviceId, position: here }); }
+      catch (error) {
+        console.error('Verification gate failed; keeping driver offline', error);
+        require('../lib/monitoring').captureError(error, { route: 'PUT /users/me/presence', userId: req.user.id });
         await supabaseAdmin.from('profiles').update({ last_online_at: null }).eq('id', req.user.id);
-        return res.status(403).json({ message: 'Complete your verification checks to go online.', code: 'verification_required' });
+        return res.status(503).json({ message: 'We could not check your verification just now, so you are still offline. Try again in a minute.', code: 'verification_unavailable', online: false });
+      }
+      if (blocked) {
+        await supabaseAdmin.from('profiles').update({ last_online_at: null }).eq('id', req.user.id);
+        return res.status(403).json({ message: 'Complete your verification checks to go online.', code: 'verification_required', online: false });
       }
     }
     const now = new Date().toISOString();
@@ -200,10 +216,15 @@ router.put('/me/presence', protect, async (req, res) => {
 router.get('/driver-application', protect, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
   try {
-    const { data, error } = await supabaseAdmin.from('driver_applications').select('submitted_at, reviewed_at, review_note').eq('driver_id', req.user.id).maybeSingle();
+    const { data, error } = await supabaseAdmin.from('driver_applications').select('*').eq('driver_id', req.user.id).maybeSingle();
     if (error) throw error;
+    const reviews = currentReviews(data?.documents, data?.document_reviews);
+    const rejected = req.user.driverApplicationStatus === 'rejected';
     return res.json({
       status: req.user.driverApplicationStatus || 'none',
+      // After a rejection: which uploads to send again (with the admin's note), and which are already accepted.
+      reupload: rejected ? Object.entries(reviews).filter(([, r]) => r.status === 'reupload').map(([kind, r]) => ({ kind, label: DOCUMENT_LABELS[kind] || kind, note: r.note })) : [],
+      approvedDocuments: rejected ? Object.keys(reviews).filter((kind) => reviews[kind].status === 'approved') : [],
       submittedAt: data?.submitted_at || null,
       reviewedAt: data?.reviewed_at || null,
       reviewNote: req.user.driverApplicationStatus === 'rejected' ? data?.review_note || null : null
@@ -214,7 +235,14 @@ router.get('/driver-application', protect, async (req, res) => {
 router.post('/driver-application', protect, async (req, res) => {
   try {
     if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
-    if (!await validateDocuments(req.user.id, req.body.documents)) return res.status(400).json({ message: 'Upload all required verification documents and photos' });
+    // After a rejection, documents an admin already accepted carry over; only the rest are sent again.
+    const { data: previous } = await supabaseAdmin.from('driver_applications').select('*').eq('driver_id', req.user.id).maybeSingle();
+    const kept = currentReviews(previous?.documents, previous?.document_reviews);
+    const carried = Object.fromEntries(Object.keys(kept).filter((kind) => kept[kind].status === 'approved').map((kind) => [kind, previous.documents[kind]]));
+    const sent = req.body.documents && typeof req.body.documents === 'object' && !Array.isArray(req.body.documents) ? req.body.documents : {};
+    const documents = Object.fromEntries(REQUIRED_DOCUMENTS.map((kind) => [kind, sent[kind] || carried[kind]]).filter(([, path]) => path));
+    req.body.documents = documents;
+    if (!await validateDocuments(req.user.id, documents)) return res.status(400).json({ message: 'Upload all required documents, face photos and car photos' });
     const { phone, vehicle, make, model, year, color, plate } = req.body;
 
     const incomingVehicle = vehicle && typeof vehicle === 'object'
@@ -234,7 +262,11 @@ router.post('/driver-application', protect, async (req, res) => {
       applicant_phone: phone.trim(), applicant_vehicle: incomingVehicle
     });
     if (submissionError) throw submissionError;
+    // Accepted documents that were carried over keep their review.
+    const keptReviews = Object.fromEntries(Object.entries(previous?.document_reviews || {}).filter(([kind, review]) => review?.status === 'approved' && review.path === documents[kind]));
     await supabaseAdmin.from('driver_applications').update({ license_expires_on: licenseExpiresOn, insurance_expires_on: insuranceExpiresOn }).eq('driver_id', req.user.id);
+    const { error: reviewsError } = await supabaseAdmin.from('driver_applications').update({ document_reviews: keptReviews }).eq('driver_id', req.user.id);
+    if (reviewsError) console.warn('Document reviews not saved (run test_run_fixes.sql)', reviewsError.message);
     await removeUnusedUploads(req.user.id, req.body.documents);
     if (carChanged) { try { await driverChecks.flag(req.user.id, 'details_changed', { details: { changed: 'vehicle' } }); } catch (error) { console.error('Re-verification flag failed', error); } }
     // New applicants verify their identity and do a first face check (the reference for later checks).
@@ -263,7 +295,7 @@ const uploadLimiter = createRateLimiter({
 
 router.post('/verification-upload', protect, uploadLimiter, async (req, res) => {
   if (req.user.role !== 'driver') return res.status(403).json({ message: 'Driver account required' });
-  if (!REQUIRED_DOCUMENTS.includes(req.body.kind) || !MIME_TYPES.has(req.body.contentType) || (req.body.kind.startsWith('photo_') && req.body.contentType === 'application/pdf')) return res.status(400).json({ message: 'Invalid document type' });
+  if (!REQUIRED_DOCUMENTS.includes(req.body.kind) || !MIME_TYPES.has(req.body.contentType) || (isPhotoKind(req.body.kind) && req.body.contentType === 'application/pdf')) return res.status(400).json({ message: 'Invalid document type' });
   try {
     const { data, error } = await createUpload(req.user.id, req.body.kind);
     if (error) throw error;
@@ -313,7 +345,7 @@ router.get('/driver-applications', protect, async (req, res) => {
 router.get('/driver-applications/:id', protect, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ message: 'Admin required' });
   try {
-    const { data, error } = await supabaseAdmin.from('driver_applications').select('documents, submitted_at').eq('driver_id', req.params.id).single();
+    const { data, error } = await supabaseAdmin.from('driver_applications').select('*').eq('driver_id', req.params.id).single();
     if (error) throw error;
     // One batch call instead of one storage round trip per document.
     const entries = Object.entries(data.documents);
@@ -324,8 +356,30 @@ router.get('/driver-applications/:id', protect, async (req, res) => {
       if (!urls[index]?.signedUrl) throw new Error('Document link unavailable');
       documents[kind] = urls[index].signedUrl;
     });
-    return res.json({ documents, submittedAt: data.submitted_at });
+    return res.json({ documents, submittedAt: data.submitted_at, reviews: currentReviews(data.documents, data.document_reviews), labels: DOCUMENT_LABELS });
   } catch { return res.status(404).json({ message: 'Application unavailable' }); }
+});
+
+// Per-document decision on a pending application: approve it, or ask for it again (with a note).
+router.put('/driver-applications/:id/documents/:kind', protect, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Admin required' });
+  const { status } = req.body;
+  if (!['approved', 'reupload', 'clear'].includes(status)) return res.status(400).json({ message: 'Invalid document decision' });
+  const note = typeof req.body.note === 'string' ? req.body.note.trim().slice(0, 300) : '';
+  try {
+    const user = await fetchUserById(req.params.id);
+    if (!user || user.role !== 'driver' || user.driverApplicationStatus !== 'pending') return res.status(409).json({ message: 'Pending driver application required' });
+    const { data, error } = await supabaseAdmin.from('driver_applications').select('*').eq('driver_id', user.id).single();
+    if (error) throw error;
+    const path = data.documents?.[req.params.kind];
+    if (!path) return res.status(404).json({ message: 'Document not in this application' });
+    const reviews = { ...(data.document_reviews || {}) };
+    if (status === 'clear') delete reviews[req.params.kind];
+    else reviews[req.params.kind] = { status, note: status === 'reupload' ? note || null : null, path, by: req.user.id, at: new Date().toISOString() };
+    const { error: updateError } = await supabaseAdmin.from('driver_applications').update({ document_reviews: reviews }).eq('driver_id', user.id).eq('submitted_at', data.submitted_at);
+    if (updateError) throw updateError;
+    return res.json({ reviews: currentReviews(data.documents, reviews) });
+  } catch (error) { return sendError(res, error, 'Unable to save the document decision'); }
 });
 router.put('/driver-applications/:id/review', protect, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ message: 'Admin required' });
@@ -333,8 +387,11 @@ router.put('/driver-applications/:id/review', protect, async (req, res) => {
   try {
     const user = await fetchUserById(req.params.id);
     if (!user || user.role !== 'driver' || user.driverApplicationStatus !== 'pending') return res.status(409).json({ message: 'Pending driver application required' });
-    const { data, error } = await supabaseAdmin.from('driver_applications').select('documents').eq('driver_id', user.id).single();
-    if (error || !await validateDocuments(user.id, data?.documents)) return res.status(400).json({ message: 'Application documents missing' });
+    const { data, error } = await supabaseAdmin.from('driver_applications').select('*').eq('driver_id', user.id).single();
+    if (error || !await validateDocuments(user.id, data?.documents, kindsIn(data?.documents))) return res.status(400).json({ message: 'Application documents missing' });
+    const reviews = currentReviews(data.documents, data.document_reviews);
+    const reupload = Object.keys(reviews).filter((kind) => reviews[kind].status === 'reupload');
+    if (req.body.status === 'approved' && reupload.length) return res.status(409).json({ message: 'Some documents are marked "upload again". Clear them or send the application back.' });
     // Operator approval must follow the operator's actual background-check process.
     if (typeof req.body.submittedAt !== 'string') return res.status(400).json({ message: 'Review the current documents and include submittedAt' });
     if (req.body.status === 'approved' && identityProvider.isReady() && (await driverChecks.identityState(user.id)).status !== 'verified') {
@@ -346,10 +403,13 @@ router.put('/driver-applications/:id/review', protect, async (req, res) => {
     if (updateError) throw updateError;
     if (!updated) return res.status(409).json({ message: 'Application changed; refresh first' });
     // Record when it was decided and, for a rejection, why (shown to the driver).
-    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    let reason = typeof req.body.reason === 'string' ? req.body.reason.trim().slice(0, 500) : '';
+    if (req.body.status === 'rejected' && !reason && reupload.length) reason = `Please upload again: ${reupload.map((kind) => DOCUMENT_LABELS[kind] || kind).join(', ')}.`;
     await supabaseAdmin.from('driver_applications').update({ reviewed_at: new Date().toISOString(), review_note: req.body.status === 'rejected' && reason ? reason : null }).eq('driver_id', user.id);
+    // Applicants from before onboarding checks existed still get their ID and first face check.
+    if (req.body.status === 'approved') { try { await driverChecks.ensureOnboarding(user.id); } catch (checkError) { console.error('Onboarding checks not created on approval', checkError); } }
     return res.json({ status: req.body.status });
-  } catch { return res.status(500).json({ message: 'Unable to review application' }); }
+  } catch (error) { console.error('Review failed', error); return res.status(500).json({ message: 'Unable to review application' }); }
 });
 
 module.exports = router;

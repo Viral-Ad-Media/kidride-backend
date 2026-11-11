@@ -221,9 +221,29 @@ router.post('/login', authLimiter, async (req, res) => {
   }
 });
 
-// Revokes every token issued to this account (all devices). Clients call it on
-// logout; the conditional update makes concurrent calls harmless.
+// Forgot password. The answer is the same whether or not the email has an account.
+router.post('/forgot-password', authLimiter, async (req, res) => {
+  const email = typeof req.body.email === 'string' ? normalizeEmail(req.body.email) : '';
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ message: 'Enter the email you signed up with' });
+  try { await require('../lib/passwordReset').requestReset(email); }
+  catch (error) { console.error('Password reset request failed', error); }
+  return res.json({ message: 'If that email has a KidRide account, a reset link is on its way. It works for 30 minutes.' });
+});
+
+router.post('/reset-password', authLimiter, async (req, res) => {
+  const { completeReset, validPassword } = require('../lib/passwordReset');
+  if (!validPassword(req.body.password)) return res.status(400).json({ message: 'Use at least 8 characters for your new password' });
+  try {
+    if (!await completeReset(req.body.token, req.body.password)) return res.status(400).json({ message: 'This reset link has expired or was already used. Ask for a new one.' });
+    return res.json({ message: 'Password changed. Log in with your new password.' });
+  } catch (error) { return sendError(res, error, 'Unable to reset the password right now'); }
+});
+
+// Logging out ends only this device's session (the app discards its token).
+// { everywhere: true } revokes every token issued to this account (all devices);
+// the conditional update makes concurrent calls harmless.
 router.post('/logout', protect, async (req, res) => {
+  if (req.body?.everywhere !== true) return res.json({ loggedOut: true });
   try {
     const { error } = await supabaseAdmin
       .from('profiles')

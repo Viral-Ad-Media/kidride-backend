@@ -57,11 +57,26 @@ let apiRouter;
 try {
   connectDB();
   const router = express.Router();
-  router.use(createRateLimiter({
+  // Signed-in requests are counted per account, so a household, office or mobile
+  // carrier sharing one IP cannot use up each other's allowance. Trip GPS and the
+  // driver heartbeat skip this limit and have their own per-account limit, so
+  // safety monitoring never loses location updates to busy polling.
+  const { accountKey, isTrackingRequest } = require('./middleware/rateLimitMiddleware');
+  const globalLimiter = createRateLimiter({
     windowMs: parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
     max: parsePositiveInt(process.env.RATE_LIMIT_MAX_REQUESTS, 1000),
-    message: 'Too many requests. Please try again later.', keyPrefix: 'global'
-  }));
+    message: 'Too many requests. Please try again later.', keyPrefix: 'global',
+    keyGenerator: accountKey
+  });
+  const trackingLimiter = createRateLimiter({
+    windowMs: 15 * 60 * 1000,
+    max: parsePositiveInt(process.env.TRACKING_RATE_LIMIT_MAX_REQUESTS, 1800),
+    message: 'Too many location updates. Please try again shortly.', keyPrefix: 'tracking',
+    keyGenerator: accountKey
+  });
+  router.use((req, res, next) => (isTrackingRequest(req) ? trackingLimiter : globalLimiter)(req, res, next));
+  // First request after a cold start checks the live database has every column the code needs.
+  router.use(require('./lib/schemaCheck').checkOnce);
   router.use('/auth', require('./routes/authRoutes'));
   router.use('/account', require('./routes/accountRoutes'));
   router.use('/users/me/trusted-contacts', require('./routes/trustedContactRoutes'));
@@ -98,6 +113,7 @@ app.get('/api/health', status);
 // Readiness for uptime monitors: one cheap database read, cached for 30 seconds
 // so the public endpoint cannot be used to load the database.
 let readiness = { at: 0, ok: false };
+let schemaProblems = null;
 app.get('/api/health/ready', async (_req, res) => {
   res.set('Cache-Control', 'no-store');
   if (!apiRouter) return res.status(503).json({ status: 'unavailable', database: 'not_checked' });
@@ -109,14 +125,16 @@ app.get('/api/health/ready', async (_req, res) => {
       const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('Database check timed out')), 3000).unref?.());
       const { error } = await Promise.race([query, timeout]);
       if (error) throw error;
-      ok = true;
+      const problems = await Promise.race([require('./lib/schemaCheck').checkSchema(), timeout]);
+      schemaProblems = problems;
+      ok = problems.length === 0;
     } catch (error) {
       console.error('Readiness check failed:', error.message);
       captureError(error, { route: '/api/health/ready' });
     }
     readiness = { at: Date.now(), ok };
   }
-  res.status(readiness.ok ? 200 : 503).json({ status: readiness.ok ? 'ready' : 'degraded', database: readiness.ok ? 'ok' : 'error', checkedAt: new Date(readiness.at).toISOString() });
+  res.status(readiness.ok ? 200 : 503).json({ status: readiness.ok ? 'ready' : 'degraded', database: readiness.ok ? 'ok' : 'error', schema: schemaProblems === null ? 'not_checked' : schemaProblems.length ? 'missing_columns' : 'ok', checkedAt: new Date(readiness.at).toISOString() });
 });
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 app.use('/api', apiRouter || ((_req, res) => res.status(503).json({ message: 'Service configuration unavailable. Contact support.' })));

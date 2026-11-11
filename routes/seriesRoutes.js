@@ -4,7 +4,7 @@ const { createRateLimiter } = require('../middleware/rateLimitMiddleware');
 const { supabaseAdmin } = require('../config/supabase');
 const { RIDE_SELECT, fetchRideRows, formatRide, updateRideRow } = require('../lib/repository');
 const { sendError } = require('../lib/http');
-const { parsePlaceCoords } = require('../lib/security');
+const { parsePlaceCoords, isSamePlace, SAME_PLACE_MESSAGE } = require('../lib/security');
 const { SERVICE_TYPES, MAX_CHILDREN_PER_RIDE, computeFare, cancellationFee } = require('../lib/pricing');
 const { loadPricing } = require('../lib/pricingSettings');
 const { tripMetrics } = require('../lib/routeMetrics');
@@ -34,6 +34,7 @@ const normalizeTrip = (req) => {
   const pickup = typeof body.pickup === 'string' ? body.pickup.trim() : '';
   const dropoff = typeof body.dropoff === 'string' ? body.dropoff.trim() : '';
   if (!pickup || !dropoff) return { error: 'Enter the pickup and drop-off first.' };
+  if (isSamePlace(pickup, dropoff, parsePlaceCoords(body.pickupCoords), parsePlaceCoords(body.dropoffCoords))) return { error: SAME_PLACE_MESSAGE };
   const serviceType = body.serviceType || 'pickup_only';
   if (!SERVICE_TYPES.includes(serviceType)) return { error: 'Invalid service type' };
   const stayMinutes = serviceType === 'stay_with_child_and_dropoff' ? (body.stayMinutes ?? 60) : 0;

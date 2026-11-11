@@ -21,7 +21,7 @@ The local server defaults to port 5000. Configure the environment before startin
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_ANON_KEY` | Password login client key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Backend-only auth administration, database, and storage access |
-| `JWT_SECRET` | Strong private secret for KidRide JWTs; tokens expire after 30 days or on `POST /auth/logout` |
+| `JWT_SECRET` | Strong private secret for KidRide JWTs; tokens expire after 30 days, on `POST /auth/logout` with `{ "everywhere": true }`, or on a password reset |
 | `FRONTEND_URLS` | Comma-separated allowed web origins |
 | `NODE_ENV` | Set to `production` to use database-backed rate counters |
 | `TRUST_PROXY_HOPS` | Verified trusted proxy count; defaults to 1 on Vercel, 0 elsewhere |
@@ -72,7 +72,9 @@ All paths below are relative to `/api`. Except registration/login and the schedu
 | --- | --- |
 | `POST /auth/register` | Public; `name`, `email`, `password`, role `parent` or `driver`. Returns 202 `{ requiresEmailVerification: true }` and no token; Supabase emails a confirmation link |
 | `POST /auth/login` | Public password login; 403 `code: email_not_confirmed` until the email is confirmed |
-| `POST /auth/logout` | Revokes every token issued to the account (all devices) |
+| `POST /auth/logout` | Ends this device's session; `{ "everywhere": true }` revokes every token issued to the account (all devices) |
+| `POST /auth/forgot-password` | Emails a one-time reset link (30 minutes); same answer whether or not the email exists |
+| `POST /auth/reset-password` | `{ token, password }` sets the new password and signs out every device |
 | `GET /auth/me` | Current profile |
 | `GET /users/profile`, `PUT /users/profile` | Own profile; editable name, phone, photo URL only |
 | `GET /users/children`, `POST /users/children` | Own child profiles |

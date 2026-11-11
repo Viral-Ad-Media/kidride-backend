@@ -91,7 +91,23 @@ const createRateLimiter = ({
   };
 };
 
+// Rate-limit key for a request: the signed-in account when the bearer token is
+// valid (checked here, not trusted from the client), otherwise the client IP.
+const accountKey = (req) => {
+  const header = req.headers?.authorization;
+  if (!header || !header.startsWith('Bearer ') || !process.env.JWT_SECRET) return null;
+  try {
+    const decoded = require('jsonwebtoken').verify(header.slice(7), process.env.JWT_SECRET);
+    return decoded?.id ? `user:${decoded.id}` : null;
+  } catch { return null; }
+};
+
+// Trip GPS updates and the driver's online heartbeat.
+const isTrackingRequest = (req) => req.method === 'PUT' && (/^\/rides\/[^/]+\/location\/?$/.test(req.path) || /^\/users\/me\/presence\/?$/.test(req.path));
+
 module.exports = {
+  accountKey,
+  isTrackingRequest,
   createRateLimiter,
   parsePositiveInt,
   getClientIdentifier
