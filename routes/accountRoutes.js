@@ -81,6 +81,11 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
     if (user.role === 'parent') {
       const { error } = await supabaseAdmin.from('ride_series').update({ status: 'cancelled', updated_at: now.toISOString() }).eq('parent_id', user.id).eq('status', 'active');
       if (error && error.code !== '42P01') throw error;
+      // A monthly plan stops billing now.
+      const subscriptions = require('../lib/subscriptions');
+      if (require('../lib/payments').enabled()) {
+        try { await subscriptions.cancelNow(user.id); } catch (planError) { if (planError.code !== '42P01') throw planError; }
+      }
     }
     // Unstarted scheduled rides: a parent's are cancelled, a driver's go back to dispatch.
     const scheduled = openRides.map((ride) => ride.id);

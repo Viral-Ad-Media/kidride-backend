@@ -106,6 +106,7 @@ try {
   router.use('/notification-receipts', require('./routes/receiptRoutes'));
   router.use('/notifications', require('./routes/notificationRoutes'));
   router.use('/payments', require('./routes/paymentRoutes'));
+  router.use('/subscriptions', require('./routes/subscriptionRoutes'));
   apiRouter = router;
 } catch (error) {
   // Variable names and stack traces belong in runtime logs, never HTTP responses.
