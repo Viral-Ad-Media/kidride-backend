@@ -28,7 +28,7 @@ router.get('/export', protect, accountLimiter, async (req, res) => {
   try {
     const id = req.user.id;
     const rideColumn = req.user.role === 'driver' ? 'driver_id' : 'parent_id';
-    const [profile, children, rides, trustedContacts, notifications, ratings, familyRatings, incidents] = await Promise.all([
+    const [profile, children, rides, trustedContacts, notifications, ratings, familyRatings, incidents, savedPlaces] = await Promise.all([
       rows(supabaseAdmin.from('profiles').select('*').eq('id', id)),
       rows(supabaseAdmin.from('children').select('id, name, age, notes, created_at, archived_at').eq('parent_id', id)),
       rows(supabaseAdmin.from('rides').select('*').eq(rideColumn, id).order('created_at', { ascending: false })),
@@ -36,7 +36,8 @@ router.get('/export', protect, accountLimiter, async (req, res) => {
       rows(supabaseAdmin.from('notifications').select('*').eq('user_id', id).order('created_at', { ascending: false }).limit(1000)),
       rows(supabaseAdmin.from('ride_ratings').select('*').or(`parent_id.eq.${id},driver_id.eq.${id}`)),
       rows(supabaseAdmin.from('family_ratings').select('*').or(`parent_id.eq.${id},driver_id.eq.${id}`)).catch(() => []),
-      rows(supabaseAdmin.from('ride_incidents').select('*').eq('reported_by', id))
+      rows(supabaseAdmin.from('ride_incidents').select('*').eq('reported_by', id)),
+      rows(supabaseAdmin.from('saved_places').select('label, address, lat, lng, kind, created_at').eq('parent_id', id)).catch(() => [])
     ]);
     // Internal security fields are not personal data and are left out.
     const { token_version: _tv, ...profileData } = profile[0] || {};
@@ -51,6 +52,7 @@ router.get('/export', protect, accountLimiter, async (req, res) => {
       children,
       rides: rideData,
       trustedContacts,
+      savedPlaces,
       notifications,
       ratings,
       familyRatings,
@@ -80,7 +82,7 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
     // Repeating bookings stop first, so no new rides are created for the account.
     if (user.role === 'parent') {
       const { error } = await supabaseAdmin.from('ride_series').update({ status: 'cancelled', updated_at: now.toISOString() }).eq('parent_id', user.id).eq('status', 'active');
-      if (error && error.code !== '42P01') throw error;
+      if (error && !['42P01', 'PGRST205'].includes(error.code)) throw error;
     }
     // Unstarted scheduled rides: a parent's are cancelled, a driver's go back to dispatch.
     const scheduled = openRides.map((ride) => ride.id);
@@ -93,7 +95,7 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
     }
 
     // Personal data with no lasting purpose is removed outright.
-    for (const [table, column] of [['trusted_contacts', 'parent_id'], ['push_tokens', 'user_id'], ['web_push_subscriptions', 'user_id'], ['notifications', 'user_id'], ['driver_locations', 'driver_id'], ['ride_offers', 'driver_id']]) {
+    for (const [table, column] of [['trusted_contacts', 'parent_id'], ['saved_places', 'parent_id'], ['push_tokens', 'user_id'], ['web_push_subscriptions', 'user_id'], ['notifications', 'user_id'], ['driver_locations', 'driver_id'], ['ride_offers', 'driver_id']]) {
       const { error } = await supabaseAdmin.from(table).delete().eq(column, user.id);
       if (error && error.code !== '42P01') throw error;
     }
