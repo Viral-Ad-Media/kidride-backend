@@ -80,14 +80,14 @@ router.post('/', protect, parentOnly, seriesLimiter, async (req, res) => {
   if (input.error) return res.status(input.status || 400).json({ message: input.error });
   try {
     const { count, error: countError } = await supabaseAdmin.from('ride_series').select('id', { count: 'exact', head: true })
-      .eq('parent_id', req.user.id).eq('status', 'active');
+      .eq('parent_id', (req.user.familyId || req.user.id)).eq('status', 'active');
     if (countError) throw countError;
     if (count >= series.MAX_ACTIVE_SERIES) return res.status(409).json({ message: `You can have up to ${series.MAX_ACTIVE_SERIES} repeating bookings. Cancel one to add another.` });
     await payments.requireCard(req.user.id);
     const metrics = await routeOf(input.trip);
     const { trip, plan } = input;
     const { data, error } = await supabaseAdmin.from('ride_series').insert({
-      parent_id: req.user.id,
+      parent_id: (req.user.familyId || req.user.id),
       child_ids: trip.childIds,
       pickup_location: trip.pickup,
       dropoff_location: trip.dropoff,
@@ -105,7 +105,7 @@ router.post('/', protect, parentOnly, seriesLimiter, async (req, res) => {
       distance_source: metrics.source
     }).select('*').single();
     if (error) throw error;
-    const created = await generateForParent(req.user.id);
+    const created = await generateForParent((req.user.familyId || req.user.id));
     const rides = await seriesRides(data.id);
     if (rides[0]) await safely(() => notifyRideEvent(rides[0], 'booked'), 'Series booked notice failed');
     return res.status(201).json({ ...series.formatSeries(data, rides.map(formatRide)), createdRides: created });
@@ -118,9 +118,9 @@ const seriesRides = (seriesId) => fetchRideRows(supabaseAdmin.from('rides').sele
 
 router.get('/', protect, parentOnly, async (req, res) => {
   try {
-    await safely(() => generateForParent(req.user.id), 'Series generation failed');
+    await safely(() => generateForParent((req.user.familyId || req.user.id)), 'Series generation failed');
     const { data, error } = await supabaseAdmin.from('ride_series').select('*')
-      .eq('parent_id', req.user.id).eq('status', 'active').order('created_at', { ascending: false }).limit(series.MAX_ACTIVE_SERIES * 2);
+      .eq('parent_id', (req.user.familyId || req.user.id)).eq('status', 'active').order('created_at', { ascending: false }).limit(series.MAX_ACTIVE_SERIES * 2);
     if (error) throw error;
     const out = [];
     for (const row of data || []) out.push(series.formatSeries(row, (await seriesRides(row.id)).map(formatRide)));
@@ -131,7 +131,7 @@ router.get('/', protect, parentOnly, async (req, res) => {
 const loadOwn = async (req, res) => {
   const { data, error } = await supabaseAdmin.from('ride_series').select('*').eq('id', req.params.id).maybeSingle();
   if (error) throw error;
-  if (!data || data.parent_id !== req.user.id) { res.status(404).json({ message: 'Repeating booking not found' }); return null; }
+  if (!data || data.parent_id !== (req.user.familyId || req.user.id)) { res.status(404).json({ message: 'Repeating booking not found' }); return null; }
   if (data.status !== 'active') { res.status(409).json({ message: 'This repeating booking has already ended' }); return null; }
   return data;
 };

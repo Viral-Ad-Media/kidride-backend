@@ -82,7 +82,7 @@ router.put('/profile', protect, async (req, res) => {
 
 router.get('/children', protect, async (req, res) => {
   try {
-    const children = await fetchChildrenRowsByParentId(req.user.id);
+    const children = await fetchChildrenRowsByParentId((req.user.familyId || req.user.id));
     return res.json(children.map(formatChild));
   } catch (error) {
     return sendError(res, error);
@@ -100,14 +100,14 @@ router.post('/children', protect, async (req, res) => {
     }
 
     const createdChild = await insertChildRow({
-      parent_id: req.user.id,
+      parent_id: (req.user.familyId || req.user.id),
       name: String(name).trim(),
       age: normalizedAge,
       notes: typeof notes === 'string' ? notes.trim() : null,
       photo_url: typeof photoUrl === 'string' ? photoUrl.trim() : null
     });
 
-    const children = await fetchChildrenRowsByParentId(req.user.id);
+    const children = await fetchChildrenRowsByParentId((req.user.familyId || req.user.id));
 
     return res.status(201).json({
       child: formatChild(createdChild),
@@ -124,7 +124,7 @@ const loadOwnChild = async (req, res) => {
   if (req.user.role !== 'parent') { res.status(403).json({ message: 'Parent account required' }); return null; }
   const { data, error } = await supabaseAdmin.from('children').select('id, parent_id, archived_at').eq('id', req.params.id).maybeSingle();
   if (error) throw error;
-  if (!data || data.parent_id !== req.user.id || data.archived_at) { res.status(404).json({ message: 'Child not found' }); return null; }
+  if (!data || data.parent_id !== (req.user.familyId || req.user.id) || data.archived_at) { res.status(404).json({ message: 'Child not found' }); return null; }
   return data;
 };
 
@@ -142,9 +142,9 @@ router.put('/children/:id', protect, async (req, res) => {
       age: normalizedAge,
       notes: typeof notes === 'string' && notes.trim() ? notes.trim() : null,
       updated_at: new Date().toISOString()
-    }).eq('id', child.id).eq('parent_id', req.user.id);
+    }).eq('id', child.id).eq('parent_id', (req.user.familyId || req.user.id));
     if (error) throw error;
-    const children = await fetchChildrenRowsByParentId(req.user.id);
+    const children = await fetchChildrenRowsByParentId((req.user.familyId || req.user.id));
     return res.json({ children: children.map(formatChild) });
   } catch (error) {
     return sendError(res, error, 'Unable to update child');
@@ -163,10 +163,10 @@ router.delete('/children/:id', protect, async (req, res) => {
     if (historyError) throw historyError;
     // Rides reference the child, so one with history is archived rather than deleted.
     const { error } = pastRides?.length
-      ? await supabaseAdmin.from('children').update({ archived_at: new Date().toISOString() }).eq('id', child.id).eq('parent_id', req.user.id)
-      : await supabaseAdmin.from('children').delete().eq('id', child.id).eq('parent_id', req.user.id);
+      ? await supabaseAdmin.from('children').update({ archived_at: new Date().toISOString() }).eq('id', child.id).eq('parent_id', (req.user.familyId || req.user.id))
+      : await supabaseAdmin.from('children').delete().eq('id', child.id).eq('parent_id', (req.user.familyId || req.user.id));
     if (error) throw error;
-    const children = await fetchChildrenRowsByParentId(req.user.id);
+    const children = await fetchChildrenRowsByParentId((req.user.familyId || req.user.id));
     return res.json({ children: children.map(formatChild) });
   } catch (error) {
     return sendError(res, error, 'Unable to remove child');

@@ -92,6 +92,7 @@ try {
   router.use('/account', require('./routes/accountRoutes'));
   router.use('/users/me/trusted-contacts', require('./routes/trustedContactRoutes'));
   router.use('/users/me/places', require('./routes/savedPlaceRoutes'));
+  router.use('/family', require('./routes/familyRoutes'));
   router.use('/users', require('./routes/adminUserRoutes'));
   router.use('/users', require('./routes/userRoutes'));
   router.use('/drivers', require('./routes/driverRoutes'));
@@ -195,6 +196,8 @@ if (require.main === module && !process.env.VERCEL) {
     io.on('connection', socket => {
       const user = socket.data.user;
       socket.join(user.id);
+      // A second guardian also follows the family's live ride updates.
+      if (user.familyId && user.familyId !== user.id) socket.join(user.familyId);
       if (isApprovedDriver(user)) socket.join('drivers');
     });
   }

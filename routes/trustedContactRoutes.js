@@ -26,7 +26,7 @@ const listContacts = async (parentId) => {
 
 router.get('/', protect, requireParent, async (req, res) => {
   try {
-    return res.json({ contacts: await listContacts(req.user.id) });
+    return res.json({ contacts: await listContacts((req.user.familyId || req.user.id)) });
   } catch (error) {
     return sendError(res, error, 'Unable to load trusted contacts');
   }
@@ -41,11 +41,11 @@ router.post('/', protect, requireParent, async (req, res) => {
   if (!PHONE_PATTERN.test(phone) || digits < 7 || digits > 15) return res.status(400).json({ message: 'Enter a valid phone number, e.g. +44 7700 900123.' });
   if (relationship.length > 50) return res.status(400).json({ message: 'Keep the relationship under 50 characters.' });
   try {
-    const existing = await listContacts(req.user.id);
+    const existing = await listContacts((req.user.familyId || req.user.id));
     if (existing.length >= MAX_CONTACTS) return res.status(409).json({ message: `You can save up to ${MAX_CONTACTS} trusted contacts. Remove one to add another.` });
-    const { error } = await supabaseAdmin.from('trusted_contacts').insert({ parent_id: req.user.id, name, phone, relationship: relationship || null });
+    const { error } = await supabaseAdmin.from('trusted_contacts').insert({ parent_id: (req.user.familyId || req.user.id), name, phone, relationship: relationship || null });
     if (error) throw error;
-    return res.status(201).json({ contacts: await listContacts(req.user.id) });
+    return res.status(201).json({ contacts: await listContacts((req.user.familyId || req.user.id)) });
   } catch (error) {
     return sendError(res, error, 'Unable to save trusted contact');
   }
@@ -53,10 +53,10 @@ router.post('/', protect, requireParent, async (req, res) => {
 
 router.delete('/:id', protect, requireParent, async (req, res) => {
   try {
-    const { data, error } = await supabaseAdmin.from('trusted_contacts').delete().eq('id', req.params.id).eq('parent_id', req.user.id).select('id');
+    const { data, error } = await supabaseAdmin.from('trusted_contacts').delete().eq('id', req.params.id).eq('parent_id', (req.user.familyId || req.user.id)).select('id');
     if (error) throw error;
     if (!data?.length) return res.status(404).json({ message: 'Contact not found' });
-    return res.json({ contacts: await listContacts(req.user.id) });
+    return res.json({ contacts: await listContacts((req.user.familyId || req.user.id)) });
   } catch (error) {
     return sendError(res, error, 'Unable to remove trusted contact');
   }

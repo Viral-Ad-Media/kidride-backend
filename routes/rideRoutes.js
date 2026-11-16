@@ -140,7 +140,7 @@ const canAccessRide = (user, ride) => {
     return true;
   }
 
-  return ride.parent_id === user.id || ride.driver_id === user.id;
+  return ride.parent_id === (user.familyId || user.id) || ride.driver_id === user.id;
 };
 
 const orFilterForUser = (userId) => `parent_id.eq.${userId},driver_id.eq.${userId}`;
@@ -185,14 +185,14 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
     await payments.requireCard(req.user.id);
     if (normalized.scheduled) {
       const { count, error: countError } = await supabaseAdmin.from('rides').select('id', { count: 'exact', head: true })
-        .eq('parent_id', req.user.id).eq('is_scheduled', true).is('series_id', null).in('status', scheduling.NOT_STARTED_STATUSES);
+        .eq('parent_id', (req.user.familyId || req.user.id)).eq('is_scheduled', true).is('series_id', null).in('status', scheduling.NOT_STARTED_STATUSES);
       if (countError) throw countError;
       if (count >= scheduling.MAX_SCHEDULED_PER_PARENT) return res.status(409).json({ message: `You can have up to ${scheduling.MAX_SCHEDULED_PER_PARENT} upcoming rides. Cancel one to book another.` });
     }
     const { data, error } = await supabaseAdmin
       .from('rides')
       .insert({
-        parent_id: req.user.id,
+        parent_id: (req.user.familyId || req.user.id),
         child_id: normalized.child,
         child_ids: normalized.childIds,
         pickup_location: normalized.pickupLocation,
@@ -300,7 +300,7 @@ router.get('/active', protect, async (req, res) => {
       supabaseAdmin
         .from('rides')
         .select(RIDE_SELECT)
-        .or(orFilterForUser(req.user.id))
+        .or(orFilterForUser(req.user.familyId || req.user.id))
         .neq('status', 'completed')
         .neq('status', 'cancelled')
         .order('updated_at', { ascending: false })
@@ -312,7 +312,7 @@ router.get('/active', protect, async (req, res) => {
 
     // While a parent waits, keep dispatch moving and say how many drivers are near.
     let searchInfo;
-    if (req.user.id === ride.parent_id && !ride.driver_id && OPEN_REQUEST_STATUSES.includes(ride.status)) {
+    if ((req.user.familyId || req.user.id) === ride.parent_id && !ride.driver_id && OPEN_REQUEST_STATUSES.includes(ride.status)) {
       if (ride.dispatch_state === 'targeted') {
         await safely(() => dispatch.advanceDispatch(ride), 'Dispatch advance failed');
         [ride] = await activeQuery();
@@ -342,7 +342,7 @@ router.get('/', protect, async (req, res) => {
       .limit(limit);
 
     if (req.user.role !== 'admin') {
-      query = query.or(orFilterForUser(req.user.id));
+      query = query.or(orFilterForUser(req.user.familyId || req.user.id));
     }
 
     if (scope === 'active') {
@@ -389,13 +389,13 @@ router.get('/', protect, async (req, res) => {
 router.get('/scheduled', protect, async (req, res) => {
   try {
     if (req.user.role !== 'parent' && !isApprovedDriver(req.user)) return res.status(403).json({ message: 'Parent or approved driver account required' });
-    if (req.user.role === 'parent') await safely(() => generateForParent(req.user.id), 'Series generation failed');
+    if (req.user.role === 'parent') await safely(() => generateForParent((req.user.familyId || req.user.id)), 'Series generation failed');
     await safely(() => dispatch.releaseDueScheduledRides(), 'Scheduled release failed');
     // Room for one-off rides plus a week of every repeating booking.
     let query = supabaseAdmin.from('rides').select(RIDE_SELECT).eq('is_scheduled', true)
       .order('pickup_time', { ascending: true }).limit(scheduling.MAX_SCHEDULED_PER_PARENT * 2 + 60);
     query = req.user.role === 'parent'
-      ? query.eq('parent_id', req.user.id).in('status', scheduling.NOT_STARTED_STATUSES)
+      ? query.eq('parent_id', (req.user.familyId || req.user.id)).in('status', scheduling.NOT_STARTED_STATUSES)
       : query.eq('driver_id', req.user.id).eq('status', 'driver_assigned');
     const rides = await fetchRideRows(query);
     return res.json(rides.map((ride) => (req.user.role === 'parent' ? formatRide(ride) : redactOffer(formatRide(ride)))));
@@ -511,7 +511,7 @@ router.get('/:id', protect, async (req, res) => {
 router.put('/:id/schedule', protect, async (req, res) => {
   try {
     const ride = await fetchRideRowById(req.params.id);
-    if (!ride || ride.parent_id !== req.user.id) return res.status(404).json({ message: 'Ride not found' });
+    if (!ride || ride.parent_id !== (req.user.familyId || req.user.id)) return res.status(404).json({ message: 'Ride not found' });
     if (!ride.is_scheduled) return res.status(409).json({ message: 'Only rides booked for later can be rescheduled' });
     if (!scheduling.isHeld(ride)) return res.status(409).json({ message: 'Drivers are already being contacted for this ride, so its time can no longer be changed. Cancel it and book again instead.' });
     const pickupTime = new Date(req.body.pickupTime);
@@ -770,7 +770,7 @@ const parentCancellationFee = async (ride, byParent) => {
 router.get('/:id/cancellation-fee', protect, async (req, res) => {
   try {
     const ride = await fetchRideRowById(req.params.id);
-    if (!ride || ride.parent_id !== req.user.id) return res.status(404).json({ message: 'Ride not found' });
+    if (!ride || ride.parent_id !== (req.user.familyId || req.user.id)) return res.status(404).json({ message: 'Ride not found' });
     return res.json({ fee: await parentCancellationFee(ride, true), currency: ride.currency || 'USD' });
   } catch (error) { return sendError(res, error); }
 });
@@ -785,7 +785,7 @@ router.put('/:id/cancel', protect, async (req, res) => {
       return res.status(409).json({ message: 'Ride is already completed or cancelled' });
     }
 
-    const isParent = ride.parent_id === req.user.id;
+    const isParent = ride.parent_id === (req.user.familyId || req.user.id);
     const isAssignedDriver = ride.driver_id && ride.driver_id === req.user.id;
     const isAdmin = req.user.role === 'admin';
     if (!isParent && !isAssignedDriver && !isAdmin) {
@@ -819,7 +819,7 @@ router.post('/:id/sos', protect, sosLimiter, async (req, res) => {
   try {
     const ride = await fetchRideRowById(req.params.id);
     if (!ride) return res.status(404).json({ message: 'Ride not found' });
-    const role = ride.parent_id === req.user.id ? 'parent' : ride.driver_id === req.user.id ? 'driver' : null;
+    const role = ride.parent_id === (req.user.familyId || req.user.id) ? 'parent' : ride.driver_id === req.user.id ? 'driver' : null;
     if (!role) return res.status(403).json({ message: 'Only the parent or driver of this ride can raise an SOS' });
     if (TERMINAL_STATUSES.has(ride.status)) return res.status(409).json({ message: 'This ride has ended. If anyone is in danger, call 911.' });
     const sent = req.body.location || {};
@@ -846,7 +846,7 @@ router.get('/:id/incidents', protect, async (req, res) => {
   try {
     const ride = await fetchRideRowById(req.params.id);
     if (!ride) return res.status(404).json({ message: 'Ride not found' });
-    if (req.user.role !== 'admin' && ride.parent_id !== req.user.id) return res.status(403).json({ message: 'Not authorized' });
+    if (req.user.role !== 'admin' && ride.parent_id !== (req.user.familyId || req.user.id)) return res.status(403).json({ message: 'Not authorized' });
     return res.json({ incidents: await listIncidents(ride.id) });
   } catch (error) { return sendError(res, error); }
 });
@@ -902,10 +902,10 @@ router.post('/:id/rating', protect, async (req, res) => {
   try {
     const ride = await fetchRideRowById(req.params.id);
     if (!ride) return res.status(404).json({ message: 'Ride not found' });
-    if (req.user.role !== 'parent' || ride.parent_id !== req.user.id) return res.status(403).json({ message: 'Only the parent who booked this ride can rate it' });
+    if (req.user.role !== 'parent' || ride.parent_id !== (req.user.familyId || req.user.id)) return res.status(403).json({ message: 'Only the parent who booked this ride can rate it' });
     if (ride.status !== 'completed' || !ride.driver_id) return res.status(409).json({ message: 'Only completed rides can be rated' });
     if (!ratingWindowOpen(ride)) return res.status(409).json({ message: 'This ride is too old to rate' });
-    const row = { ride_id: ride.id, parent_id: req.user.id, driver_id: ride.driver_id, stars: parsed.stars, comment: parsed.comment };
+    const row = { ride_id: ride.id, parent_id: (req.user.familyId || req.user.id), driver_id: ride.driver_id, stars: parsed.stars, comment: parsed.comment };
     let { data, error } = await supabaseAdmin.from('ride_ratings').insert({ ...row, tags: parsed.tags }).select('stars, tags, comment, created_at').single();
     if (schemaMissing(error)) ({ data, error } = await supabaseAdmin.from('ride_ratings').insert(row).select('stars, comment, created_at').single());
     if (error?.code === '23505') return res.status(409).json({ message: 'You have already rated this ride' });
@@ -951,7 +951,7 @@ router.get('/:id/family-rating', protect, async (req, res) => {
   try {
     const ride = await fetchRideRowById(req.params.id);
     if (!ride) return res.status(404).json({ message: 'Ride not found' });
-    if (req.user.role !== 'admin' && ride.driver_id !== req.user.id && ride.parent_id !== req.user.id) return res.status(403).json({ message: 'Not your ride' });
+    if (req.user.role !== 'admin' && ride.driver_id !== req.user.id && ride.parent_id !== (req.user.familyId || req.user.id)) return res.status(403).json({ message: 'Not your ride' });
     const summary = (await fetchFamilyRatingSummaries([ride.parent_id])).get(ride.parent_id);
     return res.json({ parentId: ride.parent_id, average: summary.average, count: summary.count, compliments: summary.compliments });
   } catch (error) {

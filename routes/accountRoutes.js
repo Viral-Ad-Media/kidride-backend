@@ -4,6 +4,7 @@ const { supabaseAdmin, supabaseAuth } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { createRateLimiter } = require('../middleware/rateLimitMiddleware');
 const { BUCKET, REQUIRED_DOCUMENTS } = require('../lib/verification');
+const { isMissingTable } = require('../lib/guardians');
 const { OPEN_RIDE_STATUSES, deletedEmail, anonymisedProfile, anonymisedChild, blockingRide, accountError } = require('../lib/account');
 
 const router = express.Router();
@@ -39,6 +40,8 @@ router.get('/export', protect, accountLimiter, async (req, res) => {
       rows(supabaseAdmin.from('ride_incidents').select('*').eq('reported_by', id)),
       rows(supabaseAdmin.from('saved_places').select('label, address, lat, lng, kind, created_at').eq('parent_id', id)).catch(() => [])
     ]);
+    // Second-guardian links this account owns or belongs to (empty until the table exists).
+    const family = await rows(supabaseAdmin.from('family_guardians').select('invitee_email, invitee_name, relationship, status, created_at, accepted_at, owner_id, guardian_id').or(`owner_id.eq.${id},guardian_id.eq.${id}`)).catch(() => []);
     // Internal security fields are not personal data and are left out.
     const { token_version: _tv, ...profileData } = profile[0] || {};
     // Drivers do not see the parent's private trip code or safe word.
@@ -56,7 +59,8 @@ router.get('/export', protect, accountLimiter, async (req, res) => {
       notifications,
       ratings,
       familyRatings,
-      safetyReports: incidents
+      safetyReports: incidents,
+      family: family.map(({ owner_id: ownerId, guardian_id: guardianId, ...link }) => ({ ...link, yourRole: ownerId === id ? 'owner' : 'guardian', guardianIsYou: guardianId === id }))
     });
   } catch (error) {
     return sendError(res, error, 'Unable to prepare your data right now');
@@ -97,6 +101,14 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
         : { status: 'cancelled', updated_at: now.toISOString() };
       const { error } = await supabaseAdmin.from('rides').update(change).in('id', scheduled);
       if (error) throw error;
+    }
+
+    // Second-guardian links end: the owner's family is closed to the guardian,
+    // and a guardian leaves the family. Invites sent to this email go too.
+    for (const [column, value] of [['owner_id', user.id], ['guardian_id', user.id], ['invitee_email', String(user.email || '').trim().toLowerCase()]]) {
+      if (!value) continue;
+      const { error } = await supabaseAdmin.from('family_guardians').delete().eq(column, value);
+      if (error && !isMissingTable(error)) throw error;
     }
 
     // Personal data with no lasting purpose is removed outright.
