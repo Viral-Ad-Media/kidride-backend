@@ -88,6 +88,8 @@ try {
   router.use((req, res, next) => (isTrackingRequest(req) ? trackingLimiter : globalLimiter)(req, res, next));
   // First request after a cold start checks the live database has every column the code needs.
   router.use(require('./lib/schemaCheck').checkOnce);
+  // Whether rides can carry extra stops yet (multi_stop.sql), checked once per start.
+  router.use(require('./lib/stops').ensureSupport);
   router.use('/auth', require('./routes/authRoutes'));
   router.use('/account', require('./routes/accountRoutes'));
   router.use('/users/me/trusted-contacts', require('./routes/trustedContactRoutes'));

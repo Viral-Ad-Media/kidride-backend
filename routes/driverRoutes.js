@@ -4,7 +4,7 @@ const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { fetchRatingSummaries } = require('../lib/ratings');
 const { DRIVER_TAGS, tagLabel, schemaMissing } = require('../lib/ratingRules');
-const { RIDE_SELECT, fetchRideRows, formatRide } = require('../lib/repository');
+const { rideSelect, fetchRideRows, formatRide } = require('../lib/repository');
 const { isApprovedDriver, redactOffer, validateCoordinates } = require('../lib/security');
 const dispatch = require('../lib/dispatch');
 const scheduling = require('../lib/scheduling');
@@ -37,7 +37,7 @@ router.get('/nearby-rides', protect, async (req, res) => {
 
     const [rides, declines, liveOffers] = await Promise.all([
       fetchRideRows(
-        supabaseAdmin.from('rides').select(RIDE_SELECT)
+        supabaseAdmin.from('rides').select(rideSelect())
           .in('status', dispatch.SEARCHING_STATUSES).is('driver_id', null)
           .order('created_at', { ascending: false }).limit(100)
       ),

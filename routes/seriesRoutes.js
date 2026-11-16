@@ -2,7 +2,7 @@ const express = require('express');
 const { protect } = require('../middleware/authMiddleware');
 const { createRateLimiter } = require('../middleware/rateLimitMiddleware');
 const { supabaseAdmin } = require('../config/supabase');
-const { RIDE_SELECT, fetchRideRows, formatRide, updateRideRow } = require('../lib/repository');
+const { rideSelect, fetchRideRows, formatRide, updateRideRow } = require('../lib/repository');
 const { sendError } = require('../lib/http');
 const { parsePlaceCoords, isSamePlace, SAME_PLACE_MESSAGE } = require('../lib/security');
 const { SERVICE_TYPES, MAX_CHILDREN_PER_RIDE, computeFare, cancellationFee } = require('../lib/pricing');
@@ -13,6 +13,7 @@ const scheduling = require('../lib/scheduling');
 const payments = require('../lib/payments');
 const series = require('../lib/series');
 const { generateForParent } = require('../lib/seriesGenerator');
+const stopsLib = require('../lib/stops');
 
 // Recurring school-week bookings: /api/ride-series
 const router = express.Router();
@@ -40,7 +41,13 @@ const normalizeTrip = (req) => {
   if (!SERVICE_TYPES.includes(serviceType)) return { error: 'Invalid service type' };
   const stayMinutes = serviceType === 'stay_with_child_and_dropoff' ? (body.stayMinutes ?? 60) : 0;
   if (!Number.isInteger(stayMinutes) || stayMinutes < 0 || stayMinutes > 480) return { error: 'Stay time must be whole minutes, up to 8 hours' };
-  return { childIds, pickup, dropoff, serviceType, stayMinutes, pickupCoords: parsePlaceCoords(body.pickupCoords), dropoffCoords: parsePlaceCoords(body.dropoffCoords) };
+  const pickupCoords = parsePlaceCoords(body.pickupCoords);
+  const dropoffCoords = parsePlaceCoords(body.dropoffCoords);
+  const { stops, error: stopsError } = stopsLib.parseStops(body.stops, { childIds });
+  if (stopsError) return { error: stopsError };
+  if (stops.length && stopsLib.routeHasRepeat({ address: pickup, coords: pickupCoords }, stops, { address: dropoff, coords: dropoffCoords })) return { error: stopsLib.STOP_SAME_PLACE_MESSAGE };
+  if (stops.length && !(stopsLib.ridesHaveStops() && stopsLib.seriesHaveStops())) return { error: stopsLib.UNAVAILABLE_MESSAGE, status: 503 };
+  return { childIds, pickup, dropoff, serviceType, stayMinutes, pickupCoords, dropoffCoords, stops };
 };
 
 const readRequest = (req) => {
@@ -52,12 +59,12 @@ const readRequest = (req) => {
 };
 
 const routeOf = async (trip) => (trip.pickupCoords && trip.dropoffCoords
-  ? tripMetrics(trip.pickupCoords, trip.dropoffCoords)
+  ? tripMetrics(trip.pickupCoords, trip.dropoffCoords, { via: trip.stops.map((stop) => stop.coords) })
   : { miles: 0, minutes: 0, source: 'none' });
 
 const fareFor = (settings, trip, metrics, pickupTime) => computeFare(settings, {
   serviceType: trip.serviceType, miles: metrics.miles, minutes: metrics.minutes, stayMinutes: trip.stayMinutes,
-  pickupTime, distanceSource: metrics.source, extraChildren: trip.childIds.length - 1
+  pickupTime, distanceSource: metrics.source, extraChildren: trip.childIds.length - 1, stopCount: trip.stops.length
 });
 
 // Before booking: the ride days and each ride's own fare (peak times differ).
@@ -93,6 +100,7 @@ router.post('/', protect, parentOnly, seriesLimiter, async (req, res) => {
       dropoff_location: trip.dropoff,
       pickup_coords: trip.pickupCoords,
       dropoff_coords: trip.dropoffCoords,
+      ...(trip.stops.length ? { stops: trip.stops } : {}),
       service_type: trip.serviceType,
       stay_minutes: trip.stayMinutes,
       weekdays: plan.weekdays,
@@ -113,7 +121,7 @@ router.post('/', protect, parentOnly, seriesLimiter, async (req, res) => {
 });
 
 // Not-yet-started rides of one series, soonest first.
-const seriesRides = (seriesId) => fetchRideRows(supabaseAdmin.from('rides').select(RIDE_SELECT)
+const seriesRides = (seriesId) => fetchRideRows(supabaseAdmin.from('rides').select(rideSelect())
   .eq('series_id', seriesId).in('status', scheduling.NOT_STARTED_STATUSES).order('pickup_time', { ascending: true }).limit(20));
 
 router.get('/', protect, parentOnly, async (req, res) => {
@@ -165,7 +173,7 @@ router.put('/:id/skip', protect, parentOnly, seriesLimiter, async (req, res) => 
     const date = req.body?.date;
     if (!series.DATE.test(date || '')) return res.status(400).json({ message: 'Choose a day to skip' });
     const isRideDay = series.upcomingDays(series.planOf(row), new Date(), 400).some((d) => d.date === date);
-    const existing = await fetchRideRows(supabaseAdmin.from('rides').select(RIDE_SELECT).eq('series_id', row.id).eq('series_date', date).limit(1));
+    const existing = await fetchRideRows(supabaseAdmin.from('rides').select(rideSelect()).eq('series_id', row.id).eq('series_date', date).limit(1));
     const ride = existing[0];
     if (!isRideDay && !ride) return res.status(400).json({ message: 'There is no upcoming ride that day' });
     if (ride && !scheduling.NOT_STARTED_STATUSES.includes(ride.status) && ride.status !== 'cancelled') return res.status(409).json({ message: 'That ride has already started' });

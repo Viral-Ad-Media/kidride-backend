@@ -16,7 +16,7 @@ function load(relative, mocks) {
 function response() { return { code: 200, headers: {}, status(n) { this.code=n; return this; }, json(body) { this.body=body; return this; }, setHeader(k,v) { this.headers[k]=v; } }; }
 function routes(repository = {}, database = {}, extra = {}) {
   const handlers = {};
-  repository = { formatRideFor: (_user, ride) => (repository.formatRide ? repository.formatRide(ride) : ride), ...repository };
+  repository = { rideSelect: () => '*', formatRideFor: (_user, ride) => (repository.formatRide ? repository.formatRide(ride) : ride), ...repository };
   const router = Object.fromEntries(['get','post','put','delete'].map(method => [method, (url,...args) => { handlers[`${method} ${url}`]=args.at(-1); }]));
   load('routes/rideRoutes.js', { express: { Router: () => router }, '../middleware/authMiddleware': { protect() {} }, '../middleware/rateLimitMiddleware': { createRateLimiter: () => () => {}, parsePositiveInt: (_, fallback) => fallback }, '../config/supabase': { supabaseAdmin: database }, '../lib/repository': repository, '../lib/security': security, '../lib/push': { notifyRide: async () => {} }, '../lib/notifications': { notifyRideEvent: async () => {} }, '../lib/ratings': { MAX_COMMENT_LENGTH: 500, fetchRatingSummaries: async (ids) => new Map(ids.map((id) => [id, { count: 1, average: 5, preciseAverage: 5, compliments: [] }])), fetchFamilyRatingSummaries: async (ids) => new Map(ids.map((id) => [id, { count: 0, average: null, preciseAverage: null, compliments: [] }])) }, '../lib/pricingSettings': { loadPricing: async () => pricing.normalizeSettings({}) }, '../lib/dispatch': { advanceDispatch: async () => {}, releaseDueScheduledRides: async () => 0, fetchLiveOffers: async () => new Map(), setOfferStatus: async () => {}, findNearbyDrivers: async () => [] }, '../lib/safetySettings': { loadSafety: async () => require('../lib/safety').normalizeSafety({}) }, '../lib/seriesGenerator': { generateForParent: async () => 0, generateAll: async () => 0 }, '../lib/incidents': { recordIncident: async (ride) => ({ incident: {}, ride }), listIncidents: async () => [], resolveIncidents: async () => null }, '../lib/driverChecks': { flag: async () => [], isBlocked: async () => false, gateOnline: async () => false, identityState: async () => ({ status: 'none' }) }, ...extra });
   return handlers;
@@ -526,7 +526,7 @@ test('nearby rides: waiting rides within 5 km of the driver, nearest first, neve
     '../middleware/authMiddleware': { protect() {} },
     '../config/supabase': { supabaseAdmin: db },
     '../lib/ratings': { fetchRatingSummaries: async () => new Map() },
-    '../lib/repository': { RIDE_SELECT: '*', fetchRideRows: async (query) => (await query).data, formatRide: (row) => ({ id: row.id, pickupLocation: row.pickup_location, tripCode: '1234', safeWord: 'secret' }) },
+    '../lib/repository': { rideSelect: () => '*', fetchRideRows: async (query) => (await query).data, formatRide: (row) => ({ id: row.id, pickupLocation: row.pickup_location, tripCode: '1234', safeWord: 'secret' }) },
     '../lib/security': security,
     '../lib/dispatch': loadDispatch(db)
   });

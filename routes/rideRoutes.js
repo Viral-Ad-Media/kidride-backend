@@ -3,7 +3,7 @@ const { protect } = require('../middleware/authMiddleware');
 const { createRateLimiter, parsePositiveInt } = require('../middleware/rateLimitMiddleware');
 const { supabaseAdmin } = require('../config/supabase');
 const {
-  RIDE_SELECT,
+  rideSelect,
   fetchRideRowById,
   fetchRideRows,
   formatRide,
@@ -31,6 +31,7 @@ const { recordIncident, listIncidents, resolveIncidents } = require('../lib/inci
 const driverChecks = require('../lib/driverChecks');
 const { trafficFactor } = require('../lib/routeMetrics');
 const payments = require('../lib/payments');
+const stopsLib = require('../lib/stops');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
@@ -120,8 +121,15 @@ const normalizeRideRequestPayload = (body) => {
   }
 
   if (isSamePlace(pickupLocation, dropoffLocation, parsePlaceCoords(body.pickupCoords), parsePlaceCoords(body.dropoffCoords))) return { error: SAME_PLACE_MESSAGE };
+  const parsedStops = stopsLib.parseStops(body.stops, { childIds });
+  if (parsedStops.error) return { error: parsedStops.error };
+  if (parsedStops.stops.length && stopsLib.routeHasRepeat({ address: pickupLocation, coords: parsePlaceCoords(body.pickupCoords) }, parsedStops.stops, { address: dropoffLocation, coords: parsePlaceCoords(body.dropoffCoords) })) {
+    return { error: stopsLib.STOP_SAME_PLACE_MESSAGE };
+  }
+  if (parsedStops.stops.length && !stopsLib.ridesHaveStops()) return { error: stopsLib.UNAVAILABLE_MESSAGE, status: 503 };
 
   return {
+    stops: parsedStops.stops,
     child: String(child),
     childIds,
     pickupLocation: String(pickupLocation).trim(),
@@ -177,7 +185,8 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       dropoffAddress: normalized.dropoffLocation,
       scheduledAt: normalized.scheduled ? normalized.pickupTime.toISOString() : null,
       stayMinutes: normalized.stayMinutes,
-      childCount: normalized.childIds.length
+      childCount: normalized.childIds.length,
+      stops: normalized.stops
     });
     if (!quotedFare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
     // Monthly plan discount, re-checked against this week's cap now.
@@ -202,8 +211,9 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
         price: fare.total,
         currency: fare.currency,
         driver_earnings: fare.driverEarnings,
-        fare_breakdown: { lines: fare.lines, miles: fare.miles, minutes: fare.minutes, stayMinutes: fare.stayMinutes, distanceSource: fare.distanceSource },
+        fare_breakdown: { lines: fare.lines, miles: fare.miles, minutes: fare.minutes, stayMinutes: fare.stayMinutes, stopCount: fare.stopCount || 0, distanceSource: fare.distanceSource },
         ...(discount > 0 ? { subscription_discount: discount } : {}),
+        ...(normalized.stops.length ? { stops: stopsLib.freshStops(normalized.stops) } : {}),
         trip_code: generateTripCode(),
         safe_word: generateSafeWord(),
         service_type: normalized.serviceType,
@@ -265,7 +275,7 @@ router.get('/open', protect, async (req, res) => {
     const rides = await fetchRideRows(
       supabaseAdmin
         .from('rides')
-        .select(RIDE_SELECT)
+        .select(rideSelect())
         .in('status', OPEN_REQUEST_STATUSES)
         .is('driver_id', null)
         .order('created_at', { ascending: false })
@@ -299,7 +309,7 @@ router.get('/active', protect, async (req, res) => {
     const activeQuery = async () => (await fetchRideRows(
       supabaseAdmin
         .from('rides')
-        .select(RIDE_SELECT)
+        .select(rideSelect())
         .or(orFilterForUser(req.user.id))
         .neq('status', 'completed')
         .neq('status', 'cancelled')
@@ -337,7 +347,7 @@ router.get('/', protect, async (req, res) => {
 
     let query = supabaseAdmin
       .from('rides')
-      .select(RIDE_SELECT)
+      .select(rideSelect())
       .order('created_at', { ascending: false })
       .limit(limit);
 
@@ -392,7 +402,7 @@ router.get('/scheduled', protect, async (req, res) => {
     if (req.user.role === 'parent') await safely(() => generateForParent(req.user.id), 'Series generation failed');
     await safely(() => dispatch.releaseDueScheduledRides(), 'Scheduled release failed');
     // Room for one-off rides plus a week of every repeating booking.
-    let query = supabaseAdmin.from('rides').select(RIDE_SELECT).eq('is_scheduled', true)
+    let query = supabaseAdmin.from('rides').select(rideSelect()).eq('is_scheduled', true)
       .order('pickup_time', { ascending: true }).limit(scheduling.MAX_SCHEDULED_PER_PARENT * 2 + 60);
     query = req.user.role === 'parent'
       ? query.eq('parent_id', req.user.id).in('status', scheduling.NOT_STARTED_STATUSES)
@@ -454,9 +464,13 @@ router.post('/quotes', protect, async (req, res) => {
   if (!Number.isInteger(stayMinutes) || stayMinutes < 0) return res.status(400).json({ message: 'Stay time must be whole minutes' });
   const childCount = req.body.childCount === undefined ? 1 : req.body.childCount;
   if (!Number.isInteger(childCount) || childCount < 1 || childCount > MAX_CHILDREN_PER_RIDE) return res.status(400).json({ message: `Choose 1 to ${MAX_CHILDREN_PER_RIDE} children` });
+  const { stops, error: stopsError } = stopsLib.parseStops(req.body.stops);
+  if (stopsError) return res.status(400).json({ message: stopsError });
+  if (stops.length && stopsLib.routeHasRepeat({ address: pickupAddress, coords: pickupCoords }, stops, { address: dropoffAddress, coords: dropoffCoords })) return res.status(400).json({ message: stopsLib.STOP_SAME_PLACE_MESSAGE });
+  if (stops.length && !stopsLib.ridesHaveStops()) return res.status(503).json({ message: stopsLib.UNAVAILABLE_MESSAGE });
   try {
     const pricing = await loadPricing();
-    const result = await quoteAllServices(pricing, req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes, childCount });
+    const result = await quoteAllServices(pricing, req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes, childCount, stops });
     return res.json(await subscriptions.decorateQuotes(req.user.id, result, scheduledAt ? new Date(scheduledAt) : new Date(), pricing.timezone));
   }
   catch (error) { return sendError(res, error, 'Unable to price this trip'); }
@@ -521,7 +535,7 @@ router.put('/:id/schedule', protect, async (req, res) => {
     const { data, error } = await supabaseAdmin.from('rides')
       .update({ pickup_time: pickupTime.toISOString(), updated_at: new Date().toISOString() })
       .eq('id', ride.id).eq('status', ride.status).is('dispatch_released_at', null)
-      .select(RIDE_SELECT).maybeSingle();
+      .select(rideSelect()).maybeSingle();
     if (error) throw error;
     if (!data) return res.status(409).json({ message: 'Drivers are already being contacted for this ride, so its time can no longer be changed.' });
     return res.json(formatRide(data));
@@ -575,7 +589,7 @@ router.put('/:id/accept', protect, async (req, res) => {
       .eq('id', req.params.id)
       .is('driver_id', null)
       .in('status', OPEN_REQUEST_STATUSES)
-      .select(RIDE_SELECT)
+      .select(rideSelect())
       .maybeSingle();
 
     if (error) {
@@ -693,6 +707,11 @@ router.put('/:id/status', protect, async (req, res) => {
           message: `Invalid status transition from ${ride.status} to ${status}`
         });
       }
+      // Every extra stop is done before the ride can finish at the drop-off.
+      if (status === 'completed' && stopsLib.pendingStops(ride.stops)) {
+        const next = stopsLib.nextStopIndex(ride.stops);
+        return res.status(409).json({ message: `Finish stop ${next + 1} (${ride.stops[next].address}) before completing the ride.` });
+      }
       // The child only gets in once the driver has entered the parent's trip code.
       if (status === 'child_picked_up' && !ride.trip_code_verified_at) {
         const failure = await checkTripCode(ride, req.body.tripCode, req.user);
@@ -732,6 +751,24 @@ const settleCancellation = async (ride) => {
   await safely(() => payments.settleRide(ride, { amount: fee, driverAmount: fee * share, purpose: ride.cancel_reason === 'no_show' ? 'no_show_fee' : 'cancellation_fee' }), 'Cancellation payment failed');
 };
 
+// The driver arrives at, then finishes, each extra stop in order: { action: 'arrive' | 'complete' }.
+router.put('/:id/stops/:index', protect, async (req, res) => {
+  try {
+    if (!isApprovedDriver(req.user)) return res.status(403).json({ message: 'Approved driver required' });
+    const ride = await fetchRideRowById(req.params.id);
+    if (!ride || ride.driver_id !== req.user.id) return res.status(403).json({ message: 'Only the assigned driver can update stops' });
+    const result = stopsLib.advanceStop(ride, Number(req.params.index), req.body.action);
+    if (result.error) return res.status(result.status).json({ message: result.error });
+    // Only the assigned driver writes stops, and only while the children are in the car.
+    const data = await updateRideRow(ride.id, { stops: result.stops }, ride.status, req.user.id);
+    await notifyRideEvent(data, result.stop.status === 'done' ? 'stop_completed' : 'stop_arrived', { stop: result.stop, total: result.stops.length });
+    emitRideUpdate(req, data);
+    return res.json(formatRideFor(req.user, data));
+  } catch (error) {
+    return sendError(res, error, 'Unable to update this stop');
+  }
+});
+
 const LOCKED_MESSAGE = 'Too many wrong trip codes. This pickup is locked and KidRide support will contact the parent. Do not let the child get in.';
 // Returns null when the entered code matches, else the response to send. Every
 // wrong code is counted, recorded as an incident and sent to the parent and admins.
@@ -744,7 +781,7 @@ const checkTripCode = async (ride, entered, user) => {
   if (tripCodeMatches(code, ride.trip_code)) return null;
   const attempt = attempts + 1;
   const { data, error } = await supabaseAdmin.from('rides').update({ trip_code_attempts: attempt })
-    .eq('id', ride.id).eq('trip_code_attempts', attempts).select(RIDE_SELECT).maybeSingle();
+    .eq('id', ride.id).eq('trip_code_attempts', attempts).select(rideSelect()).maybeSingle();
   if (error) throw error;
   if (!data) return { status: 409, body: { message: 'Ride changed. Enter the code again.' } };
   const locked = attempt >= max;
