@@ -21,6 +21,7 @@ const scheduling = require('../lib/scheduling');
 const { loadPricing } = require('../lib/pricingSettings');
 const { cancellationFee } = require('../lib/pricing');
 const { quoteAllServices, verifyQuote } = require('../lib/fareQuotes');
+const subscriptions = require('../lib/subscriptions');
 const { MAX_CHILDREN_PER_RIDE } = require('../lib/pricing');
 const { timingSafeEqual } = require('node:crypto');
 const { loadSafety } = require('../lib/safetySettings');
@@ -168,7 +169,7 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       return res.status(normalized.status || 400).json({ message: normalized.error });
     }
 
-    const fare = verifyQuote(req.body.quoteToken, req.user.id, {
+    const quotedFare = verifyQuote(req.body.quoteToken, req.user.id, {
       serviceType: normalized.serviceType,
       pickupCoords: normalized.pickupCoords,
       dropoffCoords: normalized.dropoffCoords,
@@ -178,7 +179,9 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       stayMinutes: normalized.stayMinutes,
       childCount: normalized.childIds.length
     });
-    if (!fare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
+    if (!quotedFare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
+    // Monthly plan discount, re-checked against this week's cap now.
+    const { fare, discount } = await subscriptions.priceForParent(req.user.id, quotedFare, normalized.pickupTime || new Date(), (await loadPricing()).timezone);
     await payments.requireCard(req.user.id);
     if (normalized.scheduled) {
       const { count, error: countError } = await supabaseAdmin.from('rides').select('id', { count: 'exact', head: true })
@@ -200,6 +203,7 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
         currency: fare.currency,
         driver_earnings: fare.driverEarnings,
         fare_breakdown: { lines: fare.lines, miles: fare.miles, minutes: fare.minutes, stayMinutes: fare.stayMinutes, distanceSource: fare.distanceSource },
+        ...(discount > 0 ? { subscription_discount: discount } : {}),
         trip_code: generateTripCode(),
         safe_word: generateSafeWord(),
         service_type: normalized.serviceType,
@@ -450,7 +454,11 @@ router.post('/quotes', protect, async (req, res) => {
   if (!Number.isInteger(stayMinutes) || stayMinutes < 0) return res.status(400).json({ message: 'Stay time must be whole minutes' });
   const childCount = req.body.childCount === undefined ? 1 : req.body.childCount;
   if (!Number.isInteger(childCount) || childCount < 1 || childCount > MAX_CHILDREN_PER_RIDE) return res.status(400).json({ message: `Choose 1 to ${MAX_CHILDREN_PER_RIDE} children` });
-  try { return res.json(await quoteAllServices(await loadPricing(), req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes, childCount })); }
+  try {
+    const pricing = await loadPricing();
+    const result = await quoteAllServices(pricing, req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes, childCount });
+    return res.json(await subscriptions.decorateQuotes(req.user.id, result, scheduledAt ? new Date(scheduledAt) : new Date(), pricing.timezone));
+  }
   catch (error) { return sendError(res, error, 'Unable to price this trip'); }
 });
 
