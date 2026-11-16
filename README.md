@@ -35,9 +35,18 @@ The local server defaults to port 5000. Configure the environment before startin
 | `EMAIL_REDIRECT_URL` | Optional page the signup confirmation link returns to (must be in Supabase Auth redirect URLs) |
 | `SENTRY_DSN` | Optional Sentry project DSN for server error monitoring; unset = off. No request bodies, headers or IPs are sent |
 | `SENTRY_ENVIRONMENT` | Optional Sentry environment name (defaults to the Vercel environment) |
+| `STRIPE_SECRET_KEY` | Stripe secret key (`sk_test_...` or `sk_live_...`). Turns on Stripe Identity for drivers and, with the publishable key, card payments |
+| `STRIPE_PUBLISHABLE_KEY` | Stripe publishable key (`pk_...`); the web app fetches it from `GET /api/payments/config`. Both keys set = parents must save a card to book |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret of the Stripe webhook to `/api/webhooks/stripe` (payment_intent.*, charge.dispute.created) |
+| `STRIPE_CONNECT_WEBHOOK_SECRET` | Optional signing secret of the Connect webhook (account.updated) to the same URL; without it payout status refreshes when the driver opens their dashboard |
+| `STRIPE_IDENTITY_WEBHOOK_SECRET` | Signing secret of the webhook to `/api/webhooks/stripe-identity` (identity.verification_session.*) |
+| `STRIPE_CONNECT_COUNTRY` | Optional two-letter country for new driver payout accounts; default is the Stripe platform's country |
+| `PAYMENTS_ENABLED` | Set to `false` to keep card payments off while Stripe keys are set (Identity still works) |
+| `PLATE_RECOGNIZER_TOKEN` | Plate Recognizer Snapshot Cloud API token; reads plate photos automatically (free plan: 2,500 a month, 1 per second). Unset or used up = admin compares the plate |
+| `PLATE_RECOGNIZER_REGION` | Optional plate region code such as `us` or `gb` |
 | `PORT` | Local listener port, default 5000 |
 
-Supported fare keys: `pickup_only`, `dropoff_only`, `pickup_and_dropoff`, `stay_with_child_and_dropoff`. Values must be positive numbers with at most two decimal places. Missing/malformed pricing returns 503 for that service; no default free ride is created. This is fixed-service pricing, not distance-based fare calculation, payment collection, or payouts.
+Supported fare keys: `pickup_only`, `dropoff_only`, `pickup_and_dropoff`, `stay_with_child_and_dropoff`. Values must be positive numbers with at most two decimal places. Missing/malformed pricing returns 503 for that service; no default free ride is created. 
 
 Optional throttle controls: `RATE_LIMIT_WINDOW_MS`, `RATE_LIMIT_MAX_REQUESTS` (default 1000 per 15 minutes), `AUTH_RATE_LIMIT_WINDOW_MS`, `AUTH_RATE_LIMIT_MAX_ATTEMPTS` (20 per 15 minutes), `RIDE_REQUEST_RATE_LIMIT_WINDOW_MS`, and `RIDE_REQUEST_RATE_LIMIT_MAX_REQUESTS` (10 per minute). IPs come from Express's configured trusted-proxy chain, not arbitrary forwarded header values. Production counters are shared through a database RPC and fail closed if unavailable.
 
@@ -125,7 +134,7 @@ Safety chat uses a server-side Gemini request and is general guidance only. It c
 
 `npm test` runs regression checks for signup roles, ownership, approval, fare authority, credential redaction, coordinate validation, status/cancellation concurrency, and throttling. Validate the migration in staging, then exercise the complete ride flow, signed uploads, push credentials/receipts, and physical-device GPS before operational use.
 
-Payment processing, driver payouts, automated background checks, automated liveness verification, carpool publishing, and continuous background GPS are not implemented. This code update does not itself deploy database changes or provision third-party credentials.
+Automated background checks without a Checkr key, automated liveness verification, carpool publishing, and continuous background GPS are not implemented. This code update does not itself deploy database changes or provision third-party credentials.
 
 ## Vercel startup and troubleshooting
 

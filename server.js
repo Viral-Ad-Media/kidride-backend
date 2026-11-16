@@ -37,6 +37,17 @@ app.post('/api/webhooks/stripe-identity', express.raw({ type: 'application/json'
     return res.status(error.status && error.status < 500 ? error.status : 500).json({ message: 'Webhook rejected' });
   }
 });
+// Stripe payments and payouts (PaymentIntents, Connect account updates, disputes). Same raw-body rule.
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json', limit: '500kb' }), async (req, res) => {
+  try {
+    const payments = require('./lib/payments');
+    const event = require('./lib/stripeApi').verifyEvent(req.body.toString('utf8'), req.get('stripe-signature'), payments.webhookSecrets());
+    return res.json({ received: await payments.handleEvent(event) });
+  } catch (error) {
+    if (error.status >= 500 || !error.status) console.error('Payments webhook failed', error.message);
+    return res.status(error.status && error.status < 500 ? error.status : 500).json({ message: 'Webhook rejected' });
+  }
+});
 // Checkr background check results (same raw-body rule as above).
 app.post('/api/webhooks/checkr', express.raw({ type: 'application/json', limit: '200kb' }), async (req, res) => {
   try {
@@ -94,6 +105,7 @@ try {
   router.use('/safety-chat', require('./routes/safetyRoutes'));
   router.use('/notification-receipts', require('./routes/receiptRoutes'));
   router.use('/notifications', require('./routes/notificationRoutes'));
+  router.use('/payments', require('./routes/paymentRoutes'));
   apiRouter = router;
 } catch (error) {
   // Variable names and stack traces belong in runtime logs, never HTTP responses.

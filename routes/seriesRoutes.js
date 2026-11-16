@@ -10,6 +10,7 @@ const { loadPricing } = require('../lib/pricingSettings');
 const { tripMetrics } = require('../lib/routeMetrics');
 const { notifyRideEvent } = require('../lib/notifications');
 const scheduling = require('../lib/scheduling');
+const payments = require('../lib/payments');
 const series = require('../lib/series');
 const { generateForParent } = require('../lib/seriesGenerator');
 
@@ -82,6 +83,7 @@ router.post('/', protect, parentOnly, seriesLimiter, async (req, res) => {
       .eq('parent_id', req.user.id).eq('status', 'active');
     if (countError) throw countError;
     if (count >= series.MAX_ACTIVE_SERIES) return res.status(409).json({ message: `You can have up to ${series.MAX_ACTIVE_SERIES} repeating bookings. Cancel one to add another.` });
+    await payments.requireCard(req.user.id);
     const metrics = await routeOf(input.trip);
     const { trip, plan } = input;
     const { data, error } = await supabaseAdmin.from('ride_series').insert({
@@ -142,6 +144,8 @@ const cancelRide = async (ride, settings) => {
     isScheduled: true, driverAssigned: !!ride.driver_id
   });
   const updated = await updateRideRow(ride.id, { status: 'cancelled', driver_location: null, cancellation_fee: fee }, ride.status);
+  // Releases the card hold, or charges just the fee (the assigned driver gets their share).
+  if (payments.enabled()) await safely(() => payments.settleRide(updated, { amount: fee, driverAmount: updated.driver_id ? fee * (settings?.driverShare ?? 0.8) : 0, purpose: 'cancellation_fee' }), 'Cancellation payment failed');
   await safely(() => notifyRideEvent(updated), 'Cancel notice failed');
   return fee;
 };

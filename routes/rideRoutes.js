@@ -29,6 +29,7 @@ const { generateForParent, generateAll } = require('../lib/seriesGenerator');
 const { recordIncident, listIncidents, resolveIncidents } = require('../lib/incidents');
 const driverChecks = require('../lib/driverChecks');
 const { trafficFactor } = require('../lib/routeMetrics');
+const payments = require('../lib/payments');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
@@ -178,6 +179,7 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       childCount: normalized.childIds.length
     });
     if (!fare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
+    await payments.requireCard(req.user.id);
     if (normalized.scheduled) {
       const { count, error: countError } = await supabaseAdmin.from('rides').select('id', { count: 'exact', head: true })
         .eq('parent_id', req.user.id).eq('is_scheduled', true).is('series_id', null).in('status', scheduling.NOT_STARTED_STATUSES);
@@ -366,6 +368,11 @@ router.get('/', protect, async (req, res) => {
         ride.rating = byRide.get(ride.id) || null;
         ride.canRate = !ride.rating && ride.status === 'completed' && ratingWindowOpen(rides.find((row) => row.id === ride.id));
       }
+    }
+    // Parents and admins see each ride's payment once payments are switched on.
+    if (['parent', 'admin'].includes(req.user.role) && payments.enabled()) {
+      const byRide = await payments.paymentsForRides(formatted.map((ride) => ride.id));
+      for (const ride of formatted) ride.payment = byRide.get(ride.id) || null;
     }
     return res.json(formatted);
   } catch (error) {
@@ -583,6 +590,8 @@ router.put('/:id/accept', protect, async (req, res) => {
 
     const payload = formatRide(data);
     await safely(() => dispatch.setOfferStatus(data.id, req.user.id, 'accepted'), 'Offer update failed');
+    // Hold the fare on the parent's card. A failed hold never undoes the booking; the parent is asked to fix their card.
+    await safely(() => payments.authorizeRide(data), 'Payment hold failed');
     const io = req.app.get('io');
     if (io) {
       io.to(data.parent_id).emit('ride_accepted', payload);
@@ -696,6 +705,8 @@ router.put('/:id/status', protect, async (req, res) => {
       if (updateError?.code === '23505') return res.status(409).json({ message: 'Finish your current trip before starting this one.' });
       throw updateError;
     }
+    if (updatedRide.status === 'completed') await safely(() => payments.settleRide(updatedRide, { amount: Number(updatedRide.price), driverAmount: updatedRide.driver_earnings == null ? Number(updatedRide.price) : Number(updatedRide.driver_earnings), purpose: 'ride_fare' }), 'Ride payment failed');
+    if (updatedRide.status === 'cancelled') await settleCancellation(updatedRide);
     await notifyRideEvent(updatedRide);
     emitRideUpdate(req, updatedRide);
     return res.json(formatRideFor(req.user, updatedRide));
@@ -703,6 +714,15 @@ router.put('/:id/status', protect, async (req, res) => {
     return sendError(res, error);
   }
 });
+
+// A cancelled ride releases its card hold, or charges only the cancellation or
+// no-show fee. A driver who was assigned gets their usual share of that fee.
+const settleCancellation = async (ride) => {
+  if (!payments.enabled()) return;
+  const fee = Number(ride.cancellation_fee) || 0;
+  const share = fee > 0 && ride.driver_id ? ((await safely(loadPricing, 'Pricing failed'))?.driverShare ?? 0.8) : 0;
+  await safely(() => payments.settleRide(ride, { amount: fee, driverAmount: fee * share, purpose: ride.cancel_reason === 'no_show' ? 'no_show_fee' : 'cancellation_fee' }), 'Cancellation payment failed');
+};
 
 const LOCKED_MESSAGE = 'Too many wrong trip codes. This pickup is locked and KidRide support will contact the parent. Do not let the child get in.';
 // Returns null when the entered code matches, else the response to send. Every
@@ -767,6 +787,7 @@ router.put('/:id/cancel', protect, async (req, res) => {
     if (ride.status === 'child_picked_up' && !isAdmin) return res.status(409).json({ message: 'A trip with a child onboard cannot be cancelled. Contact support.' });
     const fee = await parentCancellationFee(ride, isParent && !isAdmin);
     const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled', driver_location: null, cancellation_fee: fee }, ride.status);
+    await settleCancellation(updatedRide);
     await notifyRideEvent(updatedRide);
     emitRideUpdate(req, updatedRide);
     return res.json(formatRideFor(req.user, updatedRide));
@@ -856,6 +877,7 @@ router.put('/:id/no-show', protect, async (req, res) => {
     if (ride.status !== 'driver_arrived_at_pickup') return res.status(409).json({ message: 'Mark that you have arrived at the pickup first.' });
     if (!terms.allowed) return res.status(409).json({ message: 'Keep waiting a little longer before recording a no-show.', availableAt: terms.availableAt });
     const updated = await updateRideRow(ride.id, { status: 'cancelled', driver_location: null, cancellation_fee: terms.fee, cancel_reason: 'no_show' }, 'driver_arrived_at_pickup', req.user.id);
+    await settleCancellation(updated);
     await notifyRideEvent(updated, 'no_show');
     emitRideUpdate(req, updated);
     return res.json(formatRideFor(req.user, updated));
