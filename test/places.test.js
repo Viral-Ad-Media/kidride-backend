@@ -88,6 +88,35 @@ test('drivingRoute returns the line, seconds and metres', async () => {
   });
 });
 
+test('drivingRoute adds the turns in order only when asked', async () => {
+  await withEnv({ GOOGLE_ROUTES_API_KEY: 'server-key' }, async () => {
+    const at = (latitude, longitude) => ({ latLng: { latitude, longitude } });
+    const fetchImpl = async (_url, init) => {
+      assert.match(init.headers['X-Goog-FieldMask'], /routes\.legs\.steps\.navigationInstruction/);
+      return json(200, { routes: [{
+        distanceMeters: 900, duration: '120s', polyline: { encodedPolyline: 'ipkcFfichVnP@j@BLoFVwM{E?' },
+        legs: [{ steps: [
+          { distanceMeters: 400, navigationInstruction: { maneuver: 'DEPART', instructions: 'Head north on Oak St' }, startLocation: at(39.7, -104.9), endLocation: at(39.704, -104.9) },
+          { distanceMeters: 500, navigationInstruction: { maneuver: 'TURN_LEFT', instructions: 'Turn left onto Elm St\nDestination will be on the right' }, startLocation: at(39.704, -104.9), endLocation: at(39.704, -104.906) },
+          { distanceMeters: 5, navigationInstruction: { maneuver: 'TURN_RIGHT', instructions: 'Broken step' } }
+        ] }]
+      }] });
+    };
+    const found = await drivingRoute({ lat: 39.7, lng: -104.9 }, { lat: 39.704, lng: -104.906 }, { fetchImpl, steps: true });
+    assert.deepEqual(found.steps, [
+      { instruction: 'Head north on Oak St', maneuver: 'depart', meters: 400, start: { lat: 39.7, lng: -104.9 }, end: { lat: 39.704, lng: -104.9 } },
+      { instruction: 'Turn left onto Elm St', maneuver: 'turn_left', meters: 500, start: { lat: 39.704, lng: -104.9 }, end: { lat: 39.704, lng: -104.906 } }
+    ]);
+    const plain = await drivingRoute({ lat: 39.7, lng: -104.9 }, { lat: 39.704, lng: -104.906 }, {
+      fetchImpl: async (_url, init) => {
+        assert.doesNotMatch(init.headers['X-Goog-FieldMask'], /steps/);
+        return json(200, { routes: [{ distanceMeters: 900, duration: '120s', polyline: { encodedPolyline: 'ipkcFfichVnP@j@BLoFVwM{E?' } }] });
+      }
+    });
+    assert.equal('steps' in plain, false);
+  });
+});
+
 test('drivingRoute says when routes are not set up or there is no route', async () => {
   const from = { lat: 39.7, lng: -104.9 };
   const to = { lat: 39.8, lng: -105 };

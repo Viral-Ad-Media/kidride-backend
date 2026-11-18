@@ -1,5 +1,7 @@
 const express = require('express');
+const { createHash } = require('node:crypto');
 const { protect } = require('../middleware/authMiddleware');
+const { createRateLimiter } = require('../middleware/rateLimitMiddleware');
 const { supabaseAdmin } = require('../config/supabase');
 const { sendError } = require('../lib/http');
 const { fetchRatingSummaries } = require('../lib/ratings');
@@ -13,6 +15,43 @@ const router = express.Router();
 
 const NEARBY_RADIUS_METERS = 5000;
 const NEARBY_LIMIT = 20;
+const NEARBY_CARS_LIMIT = 8;
+
+// Free drivers around a point, for the cars a parent sees on the map before
+// booking (as Uber and Bolt show). No names and no account ids: each car gets a
+// key that changes every day, only so the app can move the same car smoothly
+// between two looks. Positions are rounded to about 10 metres.
+const nearbyCarsLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: 30,
+  message: 'Too many map requests. Wait a moment and try again.',
+  keyPrefix: 'nearby-cars',
+  keyGenerator: (req) => (req.user && req.user.id ? `user:${req.user.id}` : null)
+});
+router.get('/nearby', protect, nearbyCarsLimiter, async (req, res) => {
+  if (!['parent', 'admin'].includes(req.user.role)) return res.status(403).json({ message: 'Parent account required' });
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  if (!validateCoordinates({ latitude: lat, longitude: lng })) return res.status(400).json({ message: 'lat and lng are required' });
+  try {
+    const nearest = (await dispatch.findNearbyDrivers({ lat, lng })).slice(0, NEARBY_CARS_LIMIT);
+    if (!nearest.length) return res.json({ drivers: [] });
+    const { data, error } = await supabaseAdmin.from('driver_locations').select('driver_id, lat, lng, heading').in('driver_id', nearest.map((driver) => driver.driverId));
+    if (error) throw error;
+    const day = new Date().toISOString().slice(0, 10);
+    const round = (value) => Math.round(Number(value) * 10000) / 10000;
+    return res.json({
+      drivers: (data || []).map((row) => ({
+        key: createHash('sha256').update(`${row.driver_id}:${day}`).digest('hex').slice(0, 12),
+        lat: round(row.lat),
+        lng: round(row.lng),
+        heading: typeof row.heading === 'number' ? Math.round(row.heading) : null
+      }))
+    });
+  } catch (error) {
+    return sendError(res, error, 'Unable to load nearby drivers');
+  }
+});
 
 // Waiting rides around an idle driver, nearest first, for the map on their
 // dashboard. Rides being offered to another driver, and rides booked for

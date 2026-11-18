@@ -105,6 +105,14 @@ router.delete('/', protect, accountLimiter, async (req, res) => {
       if (error && error.code !== '42P01') throw error;
     }
 
+    // Carpool places and carpools this parent set up. These tables are newer: where one does not exist
+    // yet there is nothing to remove. (Ride chats are not removed here: they close when a ride ends and
+    // their compressed safety copy is kept with the ride's other safety records.)
+    for (const [table, column] of [['carpool_members', 'parent_id'], ['carpools', 'organiser_id']]) {
+      const { error } = await supabaseAdmin.from(table).delete().eq(column, user.id);
+      if (error && !['42P01', '42703', 'PGRST204', 'PGRST205'].includes(error.code)) throw error;
+    }
+
     if (user.role === 'parent') {
       const { error } = await supabaseAdmin.from('children').update(anonymisedChild(now)).eq('parent_id', user.id);
       if (error) throw error;

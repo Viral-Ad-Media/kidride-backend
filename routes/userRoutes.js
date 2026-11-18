@@ -23,7 +23,7 @@ const driverChecks = require('../lib/driverChecks');
 const identityProvider = require('../lib/identityProvider');
 const { loadSafety } = require('../lib/safetySettings');
 const { normalizeSafety, DEFAULT_SAFETY } = require('../lib/safety');
-const { validateCoordinates } = require('../lib/security');
+const { validateCoordinates, normalizePlate, validPlate, PLATE_MESSAGE } = require('../lib/security');
 const { saveDriverLocation } = require('../lib/dispatch');
 const router = express.Router();
 
@@ -227,7 +227,12 @@ router.get('/driver-application', protect, async (req, res) => {
       approvedDocuments: rejected ? Object.keys(reviews).filter((kind) => reviews[kind].status === 'approved') : [],
       submittedAt: data?.submitted_at || null,
       reviewedAt: data?.reviewed_at || null,
-      reviewNote: req.user.driverApplicationStatus === 'rejected' ? data?.review_note || null : null
+      reviewNote: req.user.driverApplicationStatus === 'rejected' ? data?.review_note || null : null,
+      // What was sent before, so a driver fixing a rejected upload does not type it all again.
+      phone: req.user.phone || null,
+      vehicle: req.user.vehicle || {},
+      licenseExpiresOn: data?.license_expires_on || null,
+      insuranceExpiresOn: data?.insurance_expires_on || null
     });
   } catch (error) { return sendError(res, error, 'Unable to load your application'); }
 });
@@ -250,6 +255,10 @@ router.post('/driver-application', protect, async (req, res) => {
       : { make, model, year, color, plate };
 
     if (typeof phone !== 'string' || !phone.trim() || !['make', 'model', 'year', 'color', 'plate'].every(key => typeof incomingVehicle[key] === 'string' && incomingVehicle[key].trim())) return res.status(400).json({ message: 'Phone and complete vehicle details required' });
+    // A plate is 2 to 8 letters and digits (spaces and dashes aside). Anything else is a typing
+    // mistake, caught here before the plate photo is read or a person reviews it.
+    if (!validPlate(incomingVehicle.plate)) return res.status(400).json({ message: PLATE_MESSAGE });
+    incomingVehicle.plate = normalizePlate(incomingVehicle.plate);
     // Expiry dates (YYYY-MM-DD, in the future) so KidRide can ask for new photos before they lapse.
     const futureDate = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && new Date(`${value}T23:59:59Z`) > new Date();
     const { licenseExpiresOn, insuranceExpiresOn } = req.body;

@@ -31,6 +31,10 @@ const { recordIncident, listIncidents, resolveIncidents } = require('../lib/inci
 const driverChecks = require('../lib/driverChecks');
 const { trafficFactor } = require('../lib/routeMetrics');
 const payments = require('../lib/payments');
+const { driverPhotoUrl } = require('../lib/driverPhoto');
+const rideChat = require('../lib/rideChat');
+const carpools = require('../lib/carpools');
+const promotions = require('../lib/promotions');
 
 // Dispatch failures must never break booking, offers or tracking.
 const safely = async (work, label) => { try { return await work(); } catch (error) { console.error(label, error); return undefined; } };
@@ -47,6 +51,8 @@ const emitRideUpdate = (req, ride, event = 'ride_status_updated') => {
 };
 
 const TERMINAL_STATUSES = new Set(['completed', 'cancelled']);
+// The chat of a ride that has ended closes for the parent and the driver; a compressed copy is kept for safety.
+const closeChat = (ride) => (TERMINAL_STATUSES.has(ride.status) ? safely(() => rideChat.archiveRideChat(supabaseAdmin, ride), 'Chat archive failed') : undefined);
 const OPEN_REQUEST_STATUSES = ['requested', 'searching_driver'];
 const UPCOMING_STATUSES = [
   'requested',
@@ -161,7 +167,27 @@ const fetchDeclinedRideIdsByDriver = async (driverId) => {
 router.post('/request', protect, rideRequestLimiter, async (req, res) => {
   try {
     if (req.user.role !== 'parent') return res.status(403).json({ message: 'Only parents can request rides' });
-    const ownChildIds = new Set((req.user.children || []).map((child) => child.id));
+    const promoCode = typeof req.body.promoCode === 'string' ? req.body.promoCode : undefined;
+    // The ride of a carpool: its organiser books one ride for every family in it. Who
+    // rides and where is taken from the carpool, never from the request, so a family's
+    // children can only be put in a car their own parent signed them up for.
+    let pooled = null;
+    if (req.body.carpoolId !== undefined && req.body.carpoolId !== null) {
+      pooled = await carpools.prepareBooking(supabaseAdmin, req.user, req.body.carpoolId, { scheduled: req.body.scheduled === true });
+      req.body = {
+        quoteToken: req.body.quoteToken,
+        childIds: pooled.childIds,
+        pickupLocation: pooled.trip.pickupLocation,
+        dropoffLocation: pooled.trip.dropoffLocation,
+        pickupCoords: pooled.trip.pickupCoords,
+        dropoffCoords: pooled.trip.dropoffCoords,
+        pickupTime: pooled.trip.pickupTime || new Date().toISOString(),
+        scheduled: pooled.trip.scheduled,
+        serviceType: 'pickup_only',
+        stayMinutes: 0
+      };
+    }
+    const ownChildIds = new Set(pooled ? pooled.childIds : (req.user.children || []).map((child) => child.id));
     const childIds = requestedChildIds(req.body);
     if (childIds && !childIds.every((id) => ownChildIds.has(id))) return res.status(403).json({ message: 'Select children from your account' });
     const normalized = normalizeRideRequestPayload(req.body);
@@ -181,7 +207,11 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
     });
     if (!quotedFare) return res.status(409).json({ message: 'Fare changed or quote missing. Get a current quote before booking.' });
     // Monthly plan discount, re-checked against this week's cap now.
-    const { fare, discount } = await subscriptions.priceForParent(req.user.id, quotedFare, normalized.pickupTime || new Date(), (await loadPricing()).timezone);
+    const planned = await subscriptions.priceForParent(req.user.id, quotedFare, normalized.pickupTime || new Date(), (await loadPricing()).timezone);
+    // A promo code or seasonal offer, re-checked now. A ride gets one discount: whichever is larger.
+    const promo = await promotions.priceForParent(supabaseAdmin, req.user.id, quotedFare, { code: promoCode, planDiscount: planned.discount });
+    const fare = promo.fare || planned.fare;
+    const discount = promo.fare ? 0 : planned.discount;
     await payments.requireCard(req.user.id);
     if (normalized.scheduled) {
       const { count, error: countError } = await supabaseAdmin.from('rides').select('id', { count: 'exact', head: true })
@@ -227,6 +257,9 @@ router.post('/request', protect, rideRequestLimiter, async (req, res) => {
       throw error;
     }
 
+    if (promo.promotion) await safely(() => promotions.recordRedemption(supabaseAdmin, promo.promotion, req.user.id, data.id, promo.discount), 'Promotion use not recorded');
+    // From here the carpool is closed to changes, and its other families hear about the ride.
+    if (pooled) await safely(() => carpools.markBooked(supabaseAdmin, pooled.carpool.id, data.id), 'Carpool not linked to its ride');
     let createdRide = await fetchRideRowById(data.id);
     if (createdRide.dispatch_state === 'targeted') {
       await safely(() => dispatch.advanceDispatch(createdRide), 'Dispatch failed to start');
@@ -323,7 +356,18 @@ router.get('/active', protect, async (req, res) => {
       }
     }
     if (!ride) return res.json(null);
-    return res.json(searchInfo ? { ...formatRideFor(req.user, ride), dispatch: searchInfo } : formatRideFor(req.user, ride));
+    const payload = formatRideFor(req.user, ride);
+    // The parent sees the face of the driver coming for their child, as in other ride apps.
+    const wantsPhoto = req.user.id === ride.parent_id && ride.driver_id && payload.driver && typeof payload.driver === 'object' && !payload.driver.photoUrl;
+    // Messages waiting in the ride's chat, for the badge on the Message button of both apps.
+    const inChat = !!ride.driver_id && !!rideChat.chatRole(req.user, ride);
+    const [photoUrl, chat] = await Promise.all([
+      wantsPhoto ? safely(() => driverPhotoUrl(ride.driver_id), 'Driver photo failed') : null,
+      inChat ? safely(() => rideChat.unreadSummary(supabaseAdmin, ride, req.user.id), 'Chat summary failed') : null
+    ]);
+    if (wantsPhoto) payload.driver.photoUrl = photoUrl || null;
+    if (inChat) payload.chat = chat || { unread: 0, latest: null };
+    return res.json(searchInfo ? { ...payload, dispatch: searchInfo } : payload);
   } catch (error) {
     return sendError(res, error);
   }
@@ -457,7 +501,9 @@ router.post('/quotes', protect, async (req, res) => {
   try {
     const pricing = await loadPricing();
     const result = await quoteAllServices(pricing, req.user.id, { pickupCoords, dropoffCoords, pickupAddress, dropoffAddress, scheduledAt, stayMinutes, childCount });
-    return res.json(await subscriptions.decorateQuotes(req.user.id, result, scheduledAt ? new Date(scheduledAt) : new Date(), pricing.timezone));
+    const withPlan = await subscriptions.decorateQuotes(req.user.id, result, scheduledAt ? new Date(scheduledAt) : new Date(), pricing.timezone);
+    // A promo code the parent typed, or a seasonal offer open to them: shown where it beats the plan discount.
+    return res.json(await promotions.decorateQuotes(supabaseAdmin, req.user.id, result, withPlan, { code: typeof req.body.promoCode === 'string' ? req.body.promoCode : undefined }));
   }
   catch (error) { return sendError(res, error, 'Unable to price this trip'); }
 });
@@ -716,6 +762,7 @@ router.put('/:id/status', protect, async (req, res) => {
     if (updatedRide.status === 'completed') await safely(() => payments.settleRide(updatedRide, { amount: Number(updatedRide.price), driverAmount: updatedRide.driver_earnings == null ? Number(updatedRide.price) : Number(updatedRide.driver_earnings), purpose: 'ride_fare' }), 'Ride payment failed');
     if (updatedRide.status === 'cancelled') await settleCancellation(updatedRide);
     await notifyRideEvent(updatedRide);
+    await closeChat(updatedRide);
     emitRideUpdate(req, updatedRide);
     return res.json(formatRideFor(req.user, updatedRide));
   } catch (error) {
@@ -797,6 +844,7 @@ router.put('/:id/cancel', protect, async (req, res) => {
     const updatedRide = await updateRideRow(req.params.id, { status: 'cancelled', driver_location: null, cancellation_fee: fee }, ride.status);
     await settleCancellation(updatedRide);
     await notifyRideEvent(updatedRide);
+    await closeChat(updatedRide);
     emitRideUpdate(req, updatedRide);
     return res.json(formatRideFor(req.user, updatedRide));
   } catch (error) {
@@ -887,6 +935,7 @@ router.put('/:id/no-show', protect, async (req, res) => {
     const updated = await updateRideRow(ride.id, { status: 'cancelled', driver_location: null, cancellation_fee: terms.fee, cancel_reason: 'no_show' }, 'driver_arrived_at_pickup', req.user.id);
     await settleCancellation(updated);
     await notifyRideEvent(updated, 'no_show');
+    await closeChat(updated);
     emitRideUpdate(req, updated);
     return res.json(formatRideFor(req.user, updated));
   } catch (error) { return sendError(res, error); }
